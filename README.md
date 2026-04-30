@@ -207,28 +207,20 @@ Add to your Claude Desktop config file:
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        main.go                               │
-│                    (Cobra CLI entry)                         │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                     cmd/root.go                               │
-│              (Command registration)                          │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────────┐
-│                   pkg/mcp/handlers.go                        │
-│          (MCP protocol ↔ SSH operations bridge)               │
-└───────┬─────────────────────────────────┬───────────────────┘
-        │                                 │
-┌───────▼────────┐             ┌──────────▼──────────┐
-│  pkg/ssh/       │             │   pkg/ssh/          │
-│  manager.go     │◄──────────►│   executor.go       │
-│  (connection    │             │  (persistent shell) │
-│   lifecycle)    │             │                      │
-└─────────────────┘             └──────────────────────┘
+```mermaid
+flowchart TD
+    main[main.go<br/>Cobra CLI entry]
+    root[cmd/root.go<br/>Command registration]
+    handlers[pkg/mcp/handlers.go<br/>MCP protocol ↔ SSH bridge]
+    manager[pkg/ssh/manager.go<br/>Connection lifecycle]
+    executor[pkg/ssh/executor.go<br/>Persistent shell sessions]
+    validator[pkg/ssh/validator.go<br/>Host allowlist]
+
+    main --> root
+    root --> handlers
+    handlers <--> manager
+    manager <--> executor
+    manager --> validator
 ```
 
 ### Key Components

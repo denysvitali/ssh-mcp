@@ -68,9 +68,10 @@ type ConnectionInfo struct {
 
 // Connection represents an active SSH connection with a persistent shell
 type Connection struct {
-	Info     ConnectionInfo
-	client   *ssh.Client
-	executor *ShellExecutor
+	Info            ConnectionInfo
+	client          *ssh.Client
+	executor        *ShellExecutor
+	keepaliveStop   chan struct{}
 }
 
 // Manager manages SSH connections
@@ -172,6 +173,7 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 	}
 
 	// Store connection
+	keepaliveStop := make(chan struct{})
 	m.connections[id] = &Connection{
 		Info: ConnectionInfo{
 			ID:       id,
@@ -180,9 +182,13 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 			Username: username,
 			Created:  time.Now(),
 		},
-		client:   client,
-		executor: executor,
+		client:        client,
+		executor:      executor,
+		keepaliveStop: keepaliveStop,
 	}
+
+	// Start keepalive goroutine
+	go m.keepalive(client, keepaliveStop)
 
 	return nil
 }
@@ -357,6 +363,11 @@ func (m *Manager) Close(id string) error {
 		return fmt.Errorf("connection '%s' not found", id)
 	}
 
+	// Stop keepalive goroutine
+	if conn.keepaliveStop != nil {
+		close(conn.keepaliveStop)
+	}
+
 	// Close executor and client
 	if conn.executor != nil {
 		//nolint:errcheck // Best effort cleanup
@@ -392,6 +403,10 @@ func (m *Manager) CloseAll() {
 	defer m.mu.Unlock()
 
 	for id, conn := range m.connections {
+		// Stop keepalive goroutine
+		if conn.keepaliveStop != nil {
+			close(conn.keepaliveStop)
+		}
 		if conn.executor != nil {
 			//nolint:errcheck // Best effort cleanup
 			_ = conn.executor.Close()
@@ -401,5 +416,36 @@ func (m *Manager) CloseAll() {
 			_ = conn.client.Close()
 		}
 		delete(m.connections, id)
+	}
+}
+
+// keepalive sends periodic keepalive requests to detect dead connections
+func (m *Manager) keepalive(client *ssh.Client, stop <-chan struct{}) {
+	const (
+		keepaliveInterval = 15 * time.Second
+		maxConsecutiveFailures = 3
+	)
+
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+
+	failures := 0
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			// Send a global keepalive request
+			_, _, err := client.SendRequest("keepalive@openssh.com", false, nil)
+			if err != nil {
+				failures++
+				if failures >= maxConsecutiveFailures {
+					// Connection is dead, close it
+					return
+				}
+			} else {
+				failures = 0
+			}
+		}
 	}
 }

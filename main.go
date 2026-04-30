@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/denysvitali/mcp-ssh/cmd"
-	"github.com/denysvitali/mcp-ssh/pkg/mcp"
-	"github.com/denysvitali/mcp-ssh/pkg/ssh"
+	"github.com/denysvitali/ssh-mcp/cmd"
+	"github.com/denysvitali/ssh-mcp/pkg/mcp"
+	"github.com/denysvitali/ssh-mcp/pkg/ssh"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/sirupsen/logrus"
@@ -34,8 +34,8 @@ func runServer() error {
 		return fmt.Errorf("failed to setup logger: %w", err)
 	}
 	defer func() {
-		if err := logCleanup(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to close log file: %v\n", err)
+		if logErr := logCleanup(); logErr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to close log file: %v\n", logErr)
 		}
 	}()
 
@@ -57,8 +57,14 @@ func runServer() error {
 		"allowed_hosts": allowedHosts,
 	}).Info("Host validator initialized")
 
-	// Create SSH manager
-	sshManager := ssh.NewManager(validator)
+	// Get command timeout
+	commandTimeout := cmd.GetCommandTimeout()
+	logger.WithFields(logrus.Fields{
+		"command_timeout": commandTimeout,
+	}).Info("Command timeout configured")
+
+	// Create SSH manager with configured timeout
+	sshManager := ssh.NewManager(validator, commandTimeout)
 
 	// Create MCP handlers
 	handlers := mcp.NewHandlers(sshManager, logger)
@@ -92,7 +98,7 @@ func runServer() error {
 			mcpgo.Description("SSH username"),
 		),
 		mcpgo.WithString("password",
-			mcpgo.Description("SSH password (optional if using private_key_path)"),
+			mcpgo.Description("SSH password (used for authentication or as passphrase for encrypted private keys)"),
 		),
 		mcpgo.WithString("private_key_path",
 			mcpgo.Description("Path to SSH private key file (optional if using password)"),
@@ -100,6 +106,7 @@ func runServer() error {
 	)
 
 	// Define ssh_execute tool
+	//nolint:dupl // ssh_execute and ssh_execute_async intentionally share similar parameters
 	executeTool := mcpgo.NewTool(
 		"ssh_execute",
 		mcpgo.WithDescription("Execute a command on an active SSH connection. Environment variables and working directory persist between commands."),
@@ -110,6 +117,87 @@ func runServer() error {
 		mcpgo.WithString("command",
 			mcpgo.Required(),
 			mcpgo.Description("Command to execute"),
+		),
+		mcpgo.WithNumber("max_lines",
+			mcpgo.Description("Maximum number of output lines (0 = unlimited)"),
+		),
+		mcpgo.WithNumber("max_bytes",
+			mcpgo.Description("Maximum number of output bytes (0 = unlimited)"),
+		),
+		mcpgo.WithBoolean("use_login_shell",
+			mcpgo.Description("Use login shell to source profiles (default: false)"),
+		),
+		mcpgo.WithBoolean("enable_pty",
+			mcpgo.Description("Allocate PTY for interactive apps like top, htop (default: false)"),
+		),
+		mcpgo.WithNumber("pty_cols",
+			mcpgo.Description("PTY columns (default: 80)"),
+		),
+		mcpgo.WithNumber("pty_rows",
+			mcpgo.Description("PTY rows (default: 24)"),
+		),
+	)
+
+	// Define ssh_execute_async tool
+	//nolint:dupl // ssh_execute and ssh_execute_async intentionally share similar parameters
+	executeAsyncTool := mcpgo.NewTool(
+		"ssh_execute_async",
+		mcpgo.WithDescription("Execute a command asynchronously and get a job ID for polling status"),
+		mcpgo.WithString("connection_id",
+			mcpgo.Required(),
+			mcpgo.Description("Connection identifier"),
+		),
+		mcpgo.WithString("command",
+			mcpgo.Required(),
+			mcpgo.Description("Command to execute"),
+		),
+		mcpgo.WithNumber("max_lines",
+			mcpgo.Description("Maximum number of output lines (0 = unlimited)"),
+		),
+		mcpgo.WithNumber("max_bytes",
+			mcpgo.Description("Maximum number of output bytes (0 = unlimited)"),
+		),
+		mcpgo.WithBoolean("use_login_shell",
+			mcpgo.Description("Use login shell to source profiles (default: false)"),
+		),
+		mcpgo.WithBoolean("enable_pty",
+			mcpgo.Description("Allocate PTY for interactive apps (default: false)"),
+		),
+		mcpgo.WithNumber("pty_cols",
+			mcpgo.Description("PTY columns (default: 80)"),
+		),
+		mcpgo.WithNumber("pty_rows",
+			mcpgo.Description("PTY rows (default: 24)"),
+		),
+	)
+
+	// Define ssh_job_status tool
+	jobStatusTool := mcpgo.NewTool(
+		"ssh_job_status",
+		mcpgo.WithDescription("Get the status of an asynchronous job"),
+		mcpgo.WithString("job_id",
+			mcpgo.Required(),
+			mcpgo.Description("Job identifier returned by ssh_execute_async"),
+		),
+	)
+
+	// Define ssh_job_cancel tool
+	jobCancelTool := mcpgo.NewTool(
+		"ssh_job_cancel",
+		mcpgo.WithDescription("Cancel a running job"),
+		mcpgo.WithString("job_id",
+			mcpgo.Required(),
+			mcpgo.Description("Job identifier to cancel"),
+		),
+	)
+
+	// Define ssh_job_list tool
+	jobListTool := mcpgo.NewTool(
+		"ssh_job_list",
+		mcpgo.WithDescription("List all jobs for a connection"),
+		mcpgo.WithString("connection_id",
+			mcpgo.Required(),
+			mcpgo.Description("Connection identifier"),
 		),
 	)
 
@@ -132,6 +220,10 @@ func runServer() error {
 	// Add tools to server
 	mcpServer.AddTool(connectTool, handlers.HandleConnect)
 	mcpServer.AddTool(executeTool, handlers.HandleExecute)
+	mcpServer.AddTool(executeAsyncTool, handlers.HandleExecuteAsync)
+	mcpServer.AddTool(jobStatusTool, handlers.HandleJobStatus)
+	mcpServer.AddTool(jobCancelTool, handlers.HandleJobCancel)
+	mcpServer.AddTool(jobListTool, handlers.HandleJobList)
 	mcpServer.AddTool(closeTool, handlers.HandleClose)
 	mcpServer.AddTool(listTool, handlers.HandleList)
 

@@ -8,7 +8,6 @@ run:
 linters:
   enable:
     - errcheck      # Check for unchecked errors
-    - gosimple      # Simplify code
     - govet         # Go vet
     - ineffassign   # Detect ineffectual assignments
     - staticcheck   # Staticcheck
@@ -40,6 +39,8 @@ linters:
 
     govet:
       enable-all: true
+      disable:
+        - fieldalignment
 
     gocyclo:
       min-complexity: 15

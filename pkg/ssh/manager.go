@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -16,7 +17,45 @@ const (
 
 	// SSHDialTimeout is the timeout for SSH connection establishment
 	SSHDialTimeout = 10 * time.Second
+
+	// MaxJobs is the maximum number of concurrent background jobs per connection
+	MaxJobs = 50
 )
+
+// JobStatus represents the state of a background job
+type JobStatus string
+
+const (
+	JobStatusPending   JobStatus = "pending"
+	JobStatusRunning   JobStatus = "running"
+	JobStatusCompleted JobStatus = "completed"
+	JobStatusFailed    JobStatus = "failed"
+	JobStatusCanceled  JobStatus = "canceled"
+)
+
+// Job represents a background job
+type Job struct {
+	ID           string
+	ConnectionID string
+	Command      string
+	Status       JobStatus
+	Result       *CommandResult
+	Created      time.Time
+	CompletedAt  *time.Time
+	Options      ExecuteOptions
+	cancelChan   chan struct{}
+	mu           sync.Mutex
+}
+
+// Lock locks the job mutex for safe concurrent access
+func (j *Job) Lock() {
+	j.mu.Lock()
+}
+
+// Unlock unlocks the job mutex
+func (j *Job) Unlock() {
+	j.mu.Unlock()
+}
 
 // ConnectionInfo holds information about an SSH connection
 type ConnectionInfo struct {
@@ -36,16 +75,24 @@ type Connection struct {
 
 // Manager manages SSH connections
 type Manager struct {
-	connections map[string]*Connection
-	validator   *HostValidator
-	mu          sync.RWMutex
+	connections    map[string]*Connection
+	jobs           map[string]*Job
+	validator      *HostValidator
+	mu             sync.RWMutex
+	jobMu          sync.RWMutex
+	commandTimeout time.Duration
 }
 
 // NewManager creates a new SSH connection manager
-func NewManager(validator *HostValidator) *Manager {
+func NewManager(validator *HostValidator, timeout time.Duration) *Manager {
+	if timeout <= 0 {
+		timeout = DefaultCommandTimeout
+	}
 	return &Manager{
-		connections: make(map[string]*Connection),
-		validator:   validator,
+		connections:    make(map[string]*Connection),
+		jobs:           make(map[string]*Job),
+		validator:      validator,
+		commandTimeout: timeout,
 	}
 }
 
@@ -74,8 +121,8 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 	// See: https://pkg.go.dev/golang.org/x/crypto/ssh#InsecureIgnoreHostKey
 	// #nosec G106 - Host key verification intentionally disabled for dynamic SSH connections
 	config := &ssh.ClientConfig{
-		User: username,
-		Auth: []ssh.AuthMethod{},
+		User:            username,
+		Auth:            []ssh.AuthMethod{},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         SSHDialTimeout,
 	}
@@ -93,9 +140,14 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 			return fmt.Errorf("failed to read private key file '%s': %w", privateKeyPath, err)
 		}
 
-		signer, err := ssh.ParsePrivateKey(keyData)
+		// First, try to parse as encrypted key with passphrase
+		signer, err := ssh.ParsePrivateKeyWithPassphrase(keyData, []byte(password))
 		if err != nil {
-			return fmt.Errorf("failed to parse private key: %w", err)
+			// If that fails, try parsing as unencrypted key
+			signer, err = ssh.ParsePrivateKey(keyData)
+			if err != nil {
+				return fmt.Errorf("failed to parse private key (try providing password if key is encrypted): %w", err)
+			}
 		}
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 	}
@@ -111,10 +163,11 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 		return fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
 
-	// Create persistent shell executor
-	executor, err := NewShellExecutor(client)
+	// Create persistent shell executor with configured timeout
+	executor, err := NewShellExecutor(client, m.commandTimeout)
 	if err != nil {
-		_ = client.Close() // Best effort cleanup
+		//nolint:errcheck // Best effort cleanup
+		_ = client.Close()
 		return fmt.Errorf("failed to create shell executor: %w", err)
 	}
 
@@ -136,6 +189,11 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 
 // Execute runs a command on an existing connection
 func (m *Manager) Execute(id, command string) (*CommandResult, error) {
+	return m.ExecuteWithOptions(id, command, ExecuteOptions{})
+}
+
+// ExecuteWithOptions runs a command on an existing connection with options
+func (m *Manager) ExecuteWithOptions(id, command string, opts ExecuteOptions) (*CommandResult, error) {
 	m.mu.RLock()
 	conn, exists := m.connections[id]
 	m.mu.RUnlock()
@@ -144,7 +202,149 @@ func (m *Manager) Execute(id, command string) (*CommandResult, error) {
 		return nil, fmt.Errorf("connection '%s' not found", id)
 	}
 
-	return conn.executor.Execute(command)
+	return conn.executor.ExecuteWithOptions(command, opts)
+}
+
+// ExecuteAsync starts a command execution in a goroutine and returns a job ID
+func (m *Manager) ExecuteAsync(id, command string, opts ExecuteOptions) (string, error) {
+	m.mu.RLock()
+	conn, exists := m.connections[id]
+	m.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("connection '%s' not found", id)
+	}
+
+	m.jobMu.Lock()
+	if len(m.jobs) >= MaxJobs {
+		m.jobMu.Unlock()
+		return "", fmt.Errorf("job limit reached (%d/%d)", len(m.jobs), MaxJobs)
+	}
+	m.jobMu.Unlock()
+
+	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
+	job := &Job{
+		ID:           jobID,
+		ConnectionID: id,
+		Command:      command,
+		Status:       JobStatusPending,
+		Created:      time.Now(),
+		Options:      opts,
+		cancelChan:   make(chan struct{}),
+	}
+
+	m.jobMu.Lock()
+	m.jobs[jobID] = job
+	m.jobMu.Unlock()
+
+	go func() {
+		job.mu.Lock()
+		job.Status = JobStatusRunning
+		job.mu.Unlock()
+
+		// Execute with context that can be canceled
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Start execution in a goroutine
+		doneChan := make(chan *CommandResult)
+		errChan := make(chan error)
+
+		go func() {
+			result, err := conn.executor.ExecuteWithOptions(command, opts)
+			if err != nil {
+				errChan <- err
+			} else {
+				doneChan <- result
+			}
+		}()
+
+		// Wait for completion or cancellation
+		select {
+		case result := <-doneChan:
+			job.mu.Lock()
+			job.Result = result
+			job.Status = JobStatusCompleted
+			now := time.Now()
+			job.CompletedAt = &now
+			job.mu.Unlock()
+		case err := <-errChan:
+			job.mu.Lock()
+			job.Result = &CommandResult{
+				Stdout:   "",
+				Stderr:   err.Error(),
+				ExitCode: -1,
+			}
+			job.Status = JobStatusFailed
+			now := time.Now()
+			job.CompletedAt = &now
+			job.mu.Unlock()
+		case <-job.cancelChan:
+			job.mu.Lock()
+			job.Status = JobStatusCanceled
+			now := time.Now()
+			job.CompletedAt = &now
+			job.mu.Unlock()
+			cancel()
+		case <-ctx.Done():
+			job.mu.Lock()
+			job.Status = JobStatusCanceled
+			now := time.Now()
+			job.CompletedAt = &now
+			job.mu.Unlock()
+		}
+	}()
+
+	return jobID, nil
+}
+
+// GetJob returns a job by ID
+func (m *Manager) GetJob(jobID string) (*Job, error) {
+	m.jobMu.RLock()
+	job, exists := m.jobs[jobID]
+	m.jobMu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("job '%s' not found", jobID)
+	}
+
+	return job, nil
+}
+
+// CancelJob attempts to cancel a running job
+func (m *Manager) CancelJob(jobID string) error {
+	m.jobMu.RLock()
+	job, exists := m.jobs[jobID]
+	m.jobMu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("job '%s' not found", jobID)
+	}
+
+	job.mu.Lock()
+	defer job.mu.Unlock()
+
+	if job.Status != JobStatusPending && job.Status != JobStatusRunning {
+		return fmt.Errorf("job '%s' is not cancelable (status: %s)", jobID, job.Status)
+	}
+
+	close(job.cancelChan)
+	return nil
+}
+
+// ListJobs returns all jobs for a connection
+func (m *Manager) ListJobs(connectionID string) []*Job {
+	m.jobMu.RLock()
+	defer m.jobMu.RUnlock()
+
+	jobs := make([]*Job, 0)
+	for _, job := range m.jobs {
+		if job.ConnectionID == connectionID {
+			jobs = append(jobs, job)
+		}
+	}
+
+	return jobs
 }
 
 // Close closes an SSH connection
@@ -159,10 +359,12 @@ func (m *Manager) Close(id string) error {
 
 	// Close executor and client
 	if conn.executor != nil {
-		_ = conn.executor.Close() // Best effort cleanup
+		//nolint:errcheck // Best effort cleanup
+		_ = conn.executor.Close()
 	}
 	if conn.client != nil {
-		_ = conn.client.Close() // Best effort cleanup
+		//nolint:errcheck // Best effort cleanup
+		_ = conn.client.Close()
 	}
 
 	// Remove from map
@@ -191,10 +393,12 @@ func (m *Manager) CloseAll() {
 
 	for id, conn := range m.connections {
 		if conn.executor != nil {
-			_ = conn.executor.Close() // Best effort cleanup
+			//nolint:errcheck // Best effort cleanup
+			_ = conn.executor.Close()
 		}
 		if conn.client != nil {
-			_ = conn.client.Close() // Best effort cleanup
+			//nolint:errcheck // Best effort cleanup
+			_ = conn.client.Close()
 		}
 		delete(m.connections, id)
 	}

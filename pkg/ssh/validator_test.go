@@ -12,40 +12,40 @@ func TestNewHostValidator(t *testing.T) {
 		errorContains string
 	}{
 		{
-			name:        "single host",
+			name:         "single host",
 			allowedHosts: "example.com",
-			expectError: false,
+			expectError:  false,
 		},
 		{
-			name:        "multiple hosts",
+			name:         "multiple hosts",
 			allowedHosts: "example.com,test.com,localhost",
-			expectError: false,
+			expectError:  false,
 		},
 		{
-			name:        "wildcard domain",
+			name:         "wildcard domain",
 			allowedHosts: "*.example.com",
-			expectError: false,
+			expectError:  false,
 		},
 		{
-			name:        "IP wildcard",
+			name:         "IP wildcard",
 			allowedHosts: "192.168.1.*",
-			expectError: false,
+			expectError:  false,
 		},
 		{
-			name:        "mixed patterns",
+			name:         "mixed patterns",
 			allowedHosts: "*.example.com,192.168.*,localhost",
-			expectError: false,
+			expectError:  false,
 		},
 		{
-			name:        "empty string",
-			allowedHosts: "",
-			expectError: true,
+			name:          "empty string",
+			allowedHosts:  "",
+			expectError:   true,
 			errorContains: "no allowed hosts specified",
 		},
 		{
-			name:        "only spaces",
-			allowedHosts: "   ",
-			expectError: true,
+			name:          "only spaces",
+			allowedHosts:  "   ",
+			expectError:   true,
 			errorContains: "no valid host patterns provided",
 		},
 	}

@@ -260,7 +260,7 @@ type stdoutResult struct {
 // stderrResult holds stderr reading results
 type stderrResult struct {
 	output string
-	err    *error
+	err    error
 }
 
 // collectOutput reads stdout and stderr until command completion
@@ -277,7 +277,7 @@ func (e *ShellExecutor) collectOutput(delimiter string, opts ExecuteOptions) (*C
 
 	go func() {
 		output, err := e.readStderrUntilDone(e.stderr, doneChan)
-		stderrChan <- stderrResult{output: output, err: &err}
+		stderrChan <- stderrResult{output: output, err: err}
 	}()
 
 	timeout := time.After(e.commandTimeout)
@@ -325,7 +325,7 @@ func (e *ShellExecutor) processOutput(stdoutRes stdoutResult, stderrRes stderrRe
 		return nil, fmt.Errorf("stdout read error: %w", stdoutRes.err)
 	}
 	if stderrRes.err != nil {
-		return nil, fmt.Errorf("stderr read error: %w", *stderrRes.err)
+		return nil, fmt.Errorf("stderr read error: %w", stderrRes.err)
 	}
 
 	binaryOutput := false

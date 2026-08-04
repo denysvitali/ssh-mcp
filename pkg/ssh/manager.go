@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -68,10 +67,10 @@ type ConnectionInfo struct {
 
 // Connection represents an active SSH connection with a persistent shell
 type Connection struct {
-	Info            ConnectionInfo
-	client          *ssh.Client
-	executor        *ShellExecutor
-	keepaliveStop   chan struct{}
+	Info          ConnectionInfo
+	client        *ssh.Client
+	executor      *ShellExecutor
+	keepaliveStop chan struct{}
 }
 
 // Manager manages SSH connections
@@ -97,8 +96,10 @@ func NewManager(validator *HostValidator, timeout time.Duration) *Manager {
 	}
 }
 
-// Connect establishes a new SSH connection
-func (m *Manager) Connect(id, host string, port int, username, password, privateKeyPath string) error {
+// Connect establishes a new SSH connection using the given authentication
+// options. When no explicit credentials are supplied the SSH agent and the
+// default keys in ~/.ssh are used.
+func (m *Manager) Connect(id, host string, port int, username string, auth AuthOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -117,44 +118,22 @@ func (m *Manager) Connect(id, host string, port int, username, password, private
 		return err
 	}
 
+	// Build authentication methods (agent, explicit key, discovered keys, password)
+	authMethods, cleanupAuth, _, err := buildAuthMethods(auth)
+	if err != nil {
+		return err
+	}
+	defer cleanupAuth()
+
 	// Prepare SSH config
 	// Use InsecureIgnoreHostKey for now but this should be configurable in production
 	// See: https://pkg.go.dev/golang.org/x/crypto/ssh#InsecureIgnoreHostKey
 	// #nosec G106 - Host key verification intentionally disabled for dynamic SSH connections
 	config := &ssh.ClientConfig{
 		User:            username,
-		Auth:            []ssh.AuthMethod{},
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         SSHDialTimeout,
-	}
-
-	// Add authentication methods
-	if password != "" {
-		config.Auth = append(config.Auth, ssh.Password(password))
-	}
-
-	if privateKeyPath != "" {
-		// Read private key from file
-		// #nosec G304 - Private key path is user-provided and validated by the validator
-		keyData, err := os.ReadFile(privateKeyPath)
-		if err != nil {
-			return fmt.Errorf("failed to read private key file '%s': %w", privateKeyPath, err)
-		}
-
-		// First, try to parse as encrypted key with passphrase
-		signer, err := ssh.ParsePrivateKeyWithPassphrase(keyData, []byte(password))
-		if err != nil {
-			// If that fails, try parsing as unencrypted key
-			signer, err = ssh.ParsePrivateKey(keyData)
-			if err != nil {
-				return fmt.Errorf("failed to parse private key (try providing password if key is encrypted): %w", err)
-			}
-		}
-		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
-	}
-
-	if len(config.Auth) == 0 {
-		return fmt.Errorf("no authentication method provided (password or private key required)")
 	}
 
 	// Connect to SSH server
@@ -422,7 +401,7 @@ func (m *Manager) CloseAll() {
 // keepalive sends periodic keepalive requests to detect dead connections
 func (m *Manager) keepalive(client *ssh.Client, stop <-chan struct{}) {
 	const (
-		keepaliveInterval = 15 * time.Second
+		keepaliveInterval      = 15 * time.Second
 		maxConsecutiveFailures = 3
 	)
 

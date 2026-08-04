@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/denysvitali/ssh-mcp/pkg/ssh"
@@ -38,7 +39,28 @@ type ConnectInput struct {
 	Port           int    `json:"port,omitempty" jsonschema:"SSH port (default: 22)"`
 	Username       string `json:"username" jsonschema:"SSH username"`
 	Password       string `json:"password,omitempty" jsonschema:"SSH password (used for authentication or as passphrase for encrypted private keys)"`
-	PrivateKeyPath string `json:"private_key_path,omitempty" jsonschema:"Path to SSH private key file (optional if using password)"`
+	PrivateKeyPath string `json:"private_key_path,omitempty" jsonschema:"Path to SSH private key file (optional; falls back to SSH agent and default keys in ~/.ssh)"`
+	IdentityFile   string `json:"identity_file,omitempty" jsonschema:"Alias for private_key_path"`
+	UseAgent       *bool  `json:"use_agent,omitempty" jsonschema:"Use the local SSH agent via SSH_AUTH_SOCK (default: true when SSH_AUTH_SOCK is set)"`
+}
+
+// authOptions converts the tool input into SSH auth options, applying defaults.
+func (in ConnectInput) authOptions() ssh.AuthOptions {
+	keyPath := in.PrivateKeyPath
+	if keyPath == "" {
+		keyPath = in.IdentityFile
+	}
+
+	useAgent := os.Getenv("SSH_AUTH_SOCK") != ""
+	if in.UseAgent != nil {
+		useAgent = *in.UseAgent
+	}
+
+	return ssh.AuthOptions{
+		Password:       in.Password,
+		PrivateKeyPath: keyPath,
+		UseAgent:       useAgent,
+	}
 }
 
 // ExecuteInput is the input for the ssh_execute and ssh_execute_async tools
@@ -146,14 +168,6 @@ func validateCommand(cmd string) error {
 	return nil
 }
 
-// validateAuthMethod validates authentication method is provided
-func validateAuthMethod(password, privateKeyPath string) error {
-	if password == "" && privateKeyPath == "" {
-		return fmt.Errorf("either 'password' or 'private_key_path' must be provided")
-	}
-	return nil
-}
-
 // HandleConnect handles the ssh_connect tool
 func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in ConnectInput) (*mcp.CallToolResult, any, error) {
 	if err := validateConnectionID(in.ConnectionID); err != nil {
@@ -176,9 +190,9 @@ func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in C
 		return errorResult("%s", err.Error()), nil, nil
 	}
 
-	if err := validateAuthMethod(in.Password, in.PrivateKeyPath); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
-	}
+	// No explicit credentials is allowed: the manager falls back to the SSH
+	// agent and to the default keys in ~/.ssh.
+	auth := in.authOptions()
 
 	h.logger.WithFields(logrus.Fields{
 		"connection_id": in.ConnectionID,
@@ -187,7 +201,7 @@ func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in C
 		"username":      in.Username,
 	}).Info("Attempting SSH connection")
 
-	if connErr := h.manager.Connect(in.ConnectionID, in.Host, port, in.Username, in.Password, in.PrivateKeyPath); connErr != nil {
+	if connErr := h.manager.Connect(in.ConnectionID, in.Host, port, in.Username, auth); connErr != nil {
 		h.logger.WithError(connErr).Error("Failed to establish SSH connection")
 		return errorResult("Failed to connect: %v", connErr), nil, nil
 	}

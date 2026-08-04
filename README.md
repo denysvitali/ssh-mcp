@@ -55,16 +55,54 @@ Establishes an SSH connection with a persistent shell session.
 - `host` (string, required) - Remote host address
 - `username` (string, required) - SSH username
 - `port` (number, optional) - SSH port (default: 22)
-- `password` (string, optional) - Password authentication
+- `password` (string, optional) - Password authentication, or the passphrase for an encrypted private key
 - `private_key_path` (string, optional) - Path to private key file
+- `identity_file` (string, optional) - Alias for `private_key_path`
+- `use_agent` (boolean, optional) - Use the local SSH agent via `SSH_AUTH_SOCK` (default: `true` when `SSH_AUTH_SOCK` is set)
 
-**Example:**
+**Authentication**
+
+No credentials are required. When neither `password` nor `private_key_path` /
+`identity_file` is given, the server authenticates the same way your local `ssh`
+client would:
+
+1. The SSH agent, if `SSH_AUTH_SOCK` is set and reachable (disable with `"use_agent": false`)
+2. The default keys in `~/.ssh`, tried in order: `id_ed25519`, `id_ecdsa`, `id_rsa`, `id_dsa`
+
+Encrypted keys use the `password` field as the passphrase. A discovered default
+key that is encrypted and has no passphrase is skipped rather than failing the
+connection; an explicitly requested key that is encrypted without a passphrase
+is an error.
+
+`~/.ssh/config` is **not** parsed — host aliases, `IdentityFile`, `User` and
+`Port` directives from that file are not applied.
+
+**Example (agent / default keys):**
+```json
+{
+  "connection_id": "web-server",
+  "host": "192.168.1.100",
+  "username": "admin"
+}
+```
+
+**Example (password):**
 ```json
 {
   "connection_id": "web-server",
   "host": "192.168.1.100",
   "username": "admin",
   "password": "secret"
+}
+```
+
+**Example (explicit key):**
+```json
+{
+  "connection_id": "web-server",
+  "host": "192.168.1.100",
+  "username": "admin",
+  "identity_file": "/home/user/.ssh/id_ed25519_prod"
 }
 ```
 

@@ -129,10 +129,11 @@ err := validator.Validate("10.0.0.1")      // error (not allowed)
 - Thread-safe operations (RWMutex)
 - Host validation before connection
 - Automatic cleanup on shutdown
+- Local credential discovery (see Auth Resolver below)
 
 **Connection Lifecycle**:
 ```
-Connect() → [Validate Host] → [SSH Dial] → [Create Shell] → [Store Connection]
+Connect() → [Validate Host] → [Build Auth] → [SSH Dial] → [Create Shell] → [Store Connection]
                                                                        │
                                                                        ▼
 Execute() → [Lookup Connection] → [executor.Execute()] → [Return Result]
@@ -156,6 +157,27 @@ type Manager struct {
 }
 ```
 
+### 3b. Auth Resolver (`pkg/ssh/auth.go`)
+
+**Purpose**: Builds the `[]ssh.AuthMethod` list for a connection from explicit
+input plus whatever credentials exist on the local machine.
+
+**Resolution order**:
+```
+1. SSH agent            (SSH_AUTH_SOCK, when use_agent is enabled and the socket dials)
+2. Explicit private key (private_key_path / identity_file) — hard error if unusable
+   ...otherwise...
+   Discovered keys      (~/.ssh/id_ed25519, id_ecdsa, id_rsa, id_dsa) — unusable keys skipped
+3. Password             (when provided)
+```
+
+An unreachable agent socket is a no-op, not an error. `password` doubles as the
+passphrase for encrypted keys. If the list ends up empty, `Connect` fails with a
+message describing all the available options.
+
+**Not supported**: `~/.ssh/config` parsing (would require a third-party
+dependency such as `kevinburke/ssh_config`).
+
 ### 4. MCP Handlers (`pkg/mcp/handlers.go`)
 
 **Purpose**: Bridges MCP protocol to SSH operations.
@@ -164,7 +186,8 @@ type Manager struct {
 
 1. **ssh_connect**: Establishes SSH connection
    - Validates host against allowlist
-   - Supports password or key-based auth
+   - Supports password, explicit key, SSH agent, and ~/.ssh default keys
+   - Credentials are optional; falls back to agent/local keys
    - Creates persistent shell session
    - Returns connection info
 
@@ -201,8 +224,12 @@ ssh_connect:
   - host (required)
   - port (optional, default: 22)
   - username (required)
-  - password (optional)
+  - password (optional, also used as private key passphrase)
   - private_key_path (optional)
+  - identity_file (optional, alias for private_key_path)
+  - use_agent (optional, default: true when SSH_AUTH_SOCK is set)
+  # With no explicit credentials: SSH agent, then ~/.ssh default keys
+  # (id_ed25519, id_ecdsa, id_rsa, id_dsa). ~/.ssh/config is not parsed.
 
 ssh_execute:
   - connection_id (required)

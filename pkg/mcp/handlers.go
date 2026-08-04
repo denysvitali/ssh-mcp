@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/denysvitali/ssh-mcp/pkg/ssh"
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/sirupsen/logrus"
 )
 
@@ -29,6 +29,85 @@ func NewHandlers(manager *ssh.Manager, logger *logrus.Logger) *Handlers {
 		manager: manager,
 		logger:  logger,
 	}
+}
+
+// ConnectInput is the input for the ssh_connect tool
+type ConnectInput struct {
+	ConnectionID   string `json:"connection_id" jsonschema:"Unique identifier for this connection"`
+	Host           string `json:"host" jsonschema:"Remote host address (hostname or IP)"`
+	Port           int    `json:"port,omitempty" jsonschema:"SSH port (default: 22)"`
+	Username       string `json:"username" jsonschema:"SSH username"`
+	Password       string `json:"password,omitempty" jsonschema:"SSH password (used for authentication or as passphrase for encrypted private keys)"`
+	PrivateKeyPath string `json:"private_key_path,omitempty" jsonschema:"Path to SSH private key file (optional if using password)"`
+}
+
+// ExecuteInput is the input for the ssh_execute and ssh_execute_async tools
+type ExecuteInput struct {
+	ConnectionID  string `json:"connection_id" jsonschema:"Connection identifier"`
+	Command       string `json:"command" jsonschema:"Command to execute"`
+	MaxLines      int    `json:"max_lines,omitempty" jsonschema:"Maximum number of output lines (0 = unlimited)"`
+	MaxBytes      int    `json:"max_bytes,omitempty" jsonschema:"Maximum number of output bytes (0 = unlimited)"`
+	UseLoginShell bool   `json:"use_login_shell,omitempty" jsonschema:"Use login shell to source profiles (default: false)"`
+	EnablePTY     bool   `json:"enable_pty,omitempty" jsonschema:"Allocate PTY for interactive apps like top, htop (default: false)"`
+	PtyCols       uint   `json:"pty_cols,omitempty" jsonschema:"PTY columns (default: 80)"`
+	PtyRows       uint   `json:"pty_rows,omitempty" jsonschema:"PTY rows (default: 24)"`
+}
+
+// JobInput is the input for job-scoped tools
+type JobInput struct {
+	JobID string `json:"job_id" jsonschema:"Job identifier"`
+}
+
+// ConnectionInput is the input for tools that only take a connection identifier
+type ConnectionInput struct {
+	ConnectionID string `json:"connection_id" jsonschema:"Connection identifier"`
+}
+
+// EmptyInput is the input for tools that take no parameters
+type EmptyInput struct{}
+
+// toOptions converts the tool input into SSH execute options, applying defaults
+func (in ExecuteInput) toOptions() ssh.ExecuteOptions {
+	opts := ssh.ExecuteOptions{
+		MaxLines:      in.MaxLines,
+		MaxBytes:      in.MaxBytes,
+		UseLoginShell: in.UseLoginShell,
+		EnablePTY:     in.EnablePTY,
+		PtyCols:       in.PtyCols,
+		PtyRows:       in.PtyRows,
+	}
+	if opts.PtyCols == 0 {
+		opts.PtyCols = 80
+	}
+	if opts.PtyRows == 0 {
+		opts.PtyRows = 24
+	}
+	return opts
+}
+
+// textResult builds a successful text result
+func textResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}
+}
+
+// errorResult builds an error result reported back to the model
+func errorResult(format string, args ...interface{}) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(format, args...)}},
+	}
+}
+
+// jsonResult marshals the response map into a text result
+func (h *Handlers) jsonResult(response map[string]interface{}) *mcp.CallToolResult {
+	jsonResponse, err := json.Marshal(response)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to marshal response")
+		return errorResult("Internal error: failed to marshal response: %v", err)
+	}
+	return textResult(string(jsonResponse))
 }
 
 // validateConnectionID validates the connection ID format
@@ -76,139 +155,85 @@ func validateAuthMethod(password, privateKeyPath string) error {
 }
 
 // HandleConnect handles the ssh_connect tool
-func (h *Handlers) HandleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract parameters
-	connectionID, err := req.RequireString("connection_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in ConnectInput) (*mcp.CallToolResult, any, error) {
+	if err := validateConnectionID(in.ConnectionID); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
-	// Validate connection ID
-	if validationErr := validateConnectionID(connectionID); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
+	if strings.TrimSpace(in.Host) == "" {
+		return errorResult("host cannot be empty"), nil, nil
 	}
 
-	host, err := req.RequireString("host")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if strings.TrimSpace(in.Username) == "" {
+		return errorResult("username cannot be empty"), nil, nil
 	}
 
-	// Validate host is not empty after trim
-	if strings.TrimSpace(host) == "" {
-		return mcp.NewToolResultError("host cannot be empty"), nil
+	port := in.Port
+	if port == 0 {
+		port = 22
+	}
+	if err := validatePort(port); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
-	username, err := req.RequireString("username")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Validate username is not empty after trim
-	if strings.TrimSpace(username) == "" {
-		return mcp.NewToolResultError("username cannot be empty"), nil
-	}
-
-	// Optional parameters
-	port := int(req.GetFloat("port", 22))
-	if validationErr := validatePort(port); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
-	}
-
-	password := req.GetString("password", "")
-	privateKeyPath := req.GetString("private_key_path", "")
-
-	// Validate authentication method
-	if validationErr := validateAuthMethod(password, privateKeyPath); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
+	if err := validateAuthMethod(in.Password, in.PrivateKeyPath); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"connection_id": connectionID,
-		"host":          host,
+		"connection_id": in.ConnectionID,
+		"host":          in.Host,
 		"port":          port,
-		"username":      username,
+		"username":      in.Username,
 	}).Info("Attempting SSH connection")
 
-	// Establish connection
-	if connErr := h.manager.Connect(connectionID, host, port, username, password, privateKeyPath); connErr != nil {
+	if connErr := h.manager.Connect(in.ConnectionID, in.Host, port, in.Username, in.Password, in.PrivateKeyPath); connErr != nil {
 		h.logger.WithError(connErr).Error("Failed to establish SSH connection")
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to connect: %v", connErr)), nil
+		return errorResult("Failed to connect: %v", connErr), nil, nil
 	}
 
 	h.logger.Info("SSH connection established successfully")
 
-	// Return success response
-	response := map[string]interface{}{
+	return h.jsonResult(map[string]interface{}{
 		"success":       true,
-		"connection_id": connectionID,
-		"host":          host,
+		"connection_id": in.ConnectionID,
+		"host":          in.Host,
 		"port":          port,
-		"username":      username,
+		"username":      in.Username,
 		"message":       "SSH connection established successfully",
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }
 
 // HandleExecute handles the ssh_execute tool
-func (h *Handlers) HandleExecute(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract parameters
-	connectionID, err := req.RequireString("connection_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func (h *Handlers) HandleExecute(_ context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, any, error) {
+	if err := validateConnectionID(in.ConnectionID); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
+	}
+	if err := validateCommand(in.Command); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
-	// Validate connection ID
-	if validationErr := validateConnectionID(connectionID); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
-	}
-
-	command, err := req.RequireString("command")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Validate command
-	if validationErr := validateCommand(command); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
-	}
-
-	// Optional execution options
-	opts := ssh.ExecuteOptions{
-		MaxLines:      int(req.GetFloat("max_lines", 0)),
-		MaxBytes:      int(req.GetFloat("max_bytes", 0)),
-		UseLoginShell: req.GetBool("use_login_shell", false),
-		EnablePTY:     req.GetBool("enable_pty", false),
-		PtyCols:       uint(req.GetFloat("pty_cols", 80)),
-		PtyRows:       uint(req.GetFloat("pty_rows", 24)),
-	}
+	opts := in.toOptions()
 
 	h.logger.WithFields(logrus.Fields{
-		"connection_id": connectionID,
-		"command":       command,
+		"connection_id": in.ConnectionID,
+		"command":       in.Command,
 		"max_lines":     opts.MaxLines,
 		"max_bytes":     opts.MaxBytes,
 		"enable_pty":    opts.EnablePTY,
 	}).Debug("Executing SSH command")
 
-	// Execute command with options
-	result, err := h.manager.ExecuteWithOptions(connectionID, command, opts)
+	result, err := h.manager.ExecuteWithOptions(in.ConnectionID, in.Command, opts)
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to execute SSH command")
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to execute command: %v", err)), nil
+		return errorResult("Failed to execute command: %v", err), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
 		"exit_code": result.ExitCode,
 	}).Debug("Command executed successfully")
 
-	// Return result
-	response := map[string]interface{}{
+	return h.jsonResult(map[string]interface{}{
 		"success":       true,
 		"stdout":        result.Stdout,
 		"stderr":        result.Stderr,
@@ -217,98 +242,51 @@ func (h *Handlers) HandleExecute(ctx context.Context, req mcp.CallToolRequest) (
 		"signal_name":   result.SignalName,
 		"timed_out":     result.TimedOut,
 		"binary_output": result.BinaryOutput,
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }
 
 // HandleExecuteAsync handles the ssh_execute_async tool
-func (h *Handlers) HandleExecuteAsync(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract parameters
-	connectionID, err := req.RequireString("connection_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func (h *Handlers) HandleExecuteAsync(_ context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, any, error) {
+	if err := validateConnectionID(in.ConnectionID); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
-
-	// Validate connection ID
-	if validationErr := validateConnectionID(connectionID); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
-	}
-
-	command, err := req.RequireString("command")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Validate command
-	if validationErr := validateCommand(command); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
-	}
-
-	// Optional execution options
-	opts := ssh.ExecuteOptions{
-		MaxLines:      int(req.GetFloat("max_lines", 0)),
-		MaxBytes:      int(req.GetFloat("max_bytes", 0)),
-		UseLoginShell: req.GetBool("use_login_shell", false),
-		EnablePTY:     req.GetBool("enable_pty", false),
-		PtyCols:       uint(req.GetFloat("pty_cols", 80)),
-		PtyRows:       uint(req.GetFloat("pty_rows", 24)),
+	if err := validateCommand(in.Command); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"connection_id": connectionID,
-		"command":       command,
+		"connection_id": in.ConnectionID,
+		"command":       in.Command,
 	}).Debug("Submitting async SSH command")
 
-	// Execute async command
-	jobID, err := h.manager.ExecuteAsync(connectionID, command, opts)
+	jobID, err := h.manager.ExecuteAsync(in.ConnectionID, in.Command, in.toOptions())
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to submit async SSH command")
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to submit async command: %v", err)), nil
+		return errorResult("Failed to submit async command: %v", err), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
 		"job_id": jobID,
 	}).Debug("Async SSH command submitted")
 
-	// Return job ID
-	response := map[string]interface{}{
+	return h.jsonResult(map[string]interface{}{
 		"success": true,
 		"job_id":  jobID,
 		"status":  ssh.JobStatusPending,
 		"message": "Job submitted successfully",
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }
 
 // HandleJobStatus handles the ssh_job_status tool
-func (h *Handlers) HandleJobStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract job_id parameter
-	jobID, err := req.RequireString("job_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
+func (h *Handlers) HandleJobStatus(_ context.Context, _ *mcp.CallToolRequest, in JobInput) (*mcp.CallToolResult, any, error) {
 	h.logger.WithFields(logrus.Fields{
-		"job_id": jobID,
+		"job_id": in.JobID,
 	}).Debug("Getting job status")
 
-	// Get job
-	job, err := h.manager.GetJob(jobID)
+	job, err := h.manager.GetJob(in.JobID)
 	if err != nil {
 		h.logger.WithError(err).Error("Job not found")
-		return mcp.NewToolResultError(fmt.Sprintf("Job not found: %v", err)), nil
+		return errorResult("Job not found: %v", err), nil, nil
 	}
 
 	job.Lock()
@@ -320,10 +298,9 @@ func (h *Handlers) HandleJobStatus(ctx context.Context, req mcp.CallToolRequest)
 	connectionID := job.ConnectionID
 	job.Unlock()
 
-	// Build response
 	response := map[string]interface{}{
 		"success":       true,
-		"job_id":        jobID,
+		"job_id":        in.JobID,
 		"status":        status,
 		"connection_id": connectionID,
 		"command":       command,
@@ -346,70 +323,41 @@ func (h *Handlers) HandleJobStatus(ctx context.Context, req mcp.CallToolRequest)
 		}
 	}
 
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	return h.jsonResult(response), nil, nil
 }
 
 // HandleJobCancel handles the ssh_job_cancel tool
-func (h *Handlers) HandleJobCancel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract job_id parameter
-	jobID, err := req.RequireString("job_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
+func (h *Handlers) HandleJobCancel(_ context.Context, _ *mcp.CallToolRequest, in JobInput) (*mcp.CallToolResult, any, error) {
 	h.logger.WithFields(logrus.Fields{
-		"job_id": jobID,
+		"job_id": in.JobID,
 	}).Debug("Canceling job")
 
-	// Cancel job
-	if cancelErr := h.manager.CancelJob(jobID); cancelErr != nil {
+	if cancelErr := h.manager.CancelJob(in.JobID); cancelErr != nil {
 		h.logger.WithError(cancelErr).Error("Failed to cancel job")
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to cancel job: %v", cancelErr)), nil
+		return errorResult("Failed to cancel job: %v", cancelErr), nil, nil
 	}
 
 	h.logger.Info("Job canceled successfully")
 
-	// Return success response
-	response := map[string]interface{}{
+	return h.jsonResult(map[string]interface{}{
 		"success": true,
-		"job_id":  jobID,
+		"job_id":  in.JobID,
 		"message": "Job canceled successfully",
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }
 
 // HandleJobList handles the ssh_job_list tool
-func (h *Handlers) HandleJobList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract connection_id parameter
-	connectionID, err := req.RequireString("connection_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Validate connection ID
-	if validationErr := validateConnectionID(connectionID); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
+func (h *Handlers) HandleJobList(_ context.Context, _ *mcp.CallToolRequest, in ConnectionInput) (*mcp.CallToolResult, any, error) {
+	if err := validateConnectionID(in.ConnectionID); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"connection_id": connectionID,
+		"connection_id": in.ConnectionID,
 	}).Debug("Listing jobs")
 
-	// Get jobs
-	jobs := h.manager.ListJobs(connectionID)
+	jobs := h.manager.ListJobs(in.ConnectionID)
 
-	// Convert to response format
 	jobList := make([]map[string]interface{}, len(jobs))
 	for i, job := range jobs {
 		job.Lock()
@@ -426,73 +374,48 @@ func (h *Handlers) HandleJobList(ctx context.Context, req mcp.CallToolRequest) (
 		jobList[i] = jobInfo
 	}
 
-	response := map[string]interface{}{
-		"success:":      true,
-		"connection_id": connectionID,
+	return h.jsonResult(map[string]interface{}{
+		"success":       true,
+		"connection_id": in.ConnectionID,
 		"jobs":          jobList,
 		"count":         len(jobs),
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }
 
 // HandleClose handles the ssh_close tool
-func (h *Handlers) HandleClose(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Extract parameters
-	connectionID, err := req.RequireString("connection_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Validate connection ID
-	if validationErr := validateConnectionID(connectionID); validationErr != nil {
-		return mcp.NewToolResultError(validationErr.Error()), nil
+func (h *Handlers) HandleClose(_ context.Context, _ *mcp.CallToolRequest, in ConnectionInput) (*mcp.CallToolResult, any, error) {
+	if err := validateConnectionID(in.ConnectionID); err != nil {
+		return errorResult("%s", err.Error()), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"connection_id": connectionID,
+		"connection_id": in.ConnectionID,
 	}).Info("Closing SSH connection")
 
-	// Close connection
-	if closeErr := h.manager.Close(connectionID); closeErr != nil {
+	if closeErr := h.manager.Close(in.ConnectionID); closeErr != nil {
 		h.logger.WithError(closeErr).Error("Failed to close SSH connection")
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to close connection: %v", closeErr)), nil
+		return errorResult("Failed to close connection: %v", closeErr), nil, nil
 	}
 
 	h.logger.Info("SSH connection closed successfully")
 
-	// Return success response
-	response := map[string]interface{}{
+	return h.jsonResult(map[string]interface{}{
 		"success":       true,
-		"connection_id": connectionID,
+		"connection_id": in.ConnectionID,
 		"message":       "SSH connection closed successfully",
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }
 
 // HandleList handles the ssh_list tool
-func (h *Handlers) HandleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *Handlers) HandleList(_ context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, any, error) {
 	h.logger.Debug("Listing active SSH connections")
 
-	// Get list of connections
 	connections := h.manager.List()
 
 	h.logger.WithFields(logrus.Fields{
 		"count": len(connections),
 	}).Debug("Retrieved connection list")
 
-	// Convert to response format
 	connList := make([]map[string]interface{}, len(connections))
 	for i, conn := range connections {
 		connList[i] = map[string]interface{}{
@@ -504,16 +427,9 @@ func (h *Handlers) HandleList(ctx context.Context, req mcp.CallToolRequest) (*mc
 		}
 	}
 
-	response := map[string]interface{}{
+	return h.jsonResult(map[string]interface{}{
 		"success":     true,
 		"connections": connList,
 		"count":       len(connections),
-	}
-
-	jsonResponse, err := json.Marshal(response)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to marshal response")
-		return mcp.NewToolResultError(fmt.Sprintf("Internal error: failed to marshal response: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(jsonResponse)), nil
+	}), nil, nil
 }

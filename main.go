@@ -10,8 +10,7 @@ import (
 	"github.com/denysvitali/ssh-mcp/cmd"
 	"github.com/denysvitali/ssh-mcp/pkg/mcp"
 	"github.com/denysvitali/ssh-mcp/pkg/ssh"
-	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/sirupsen/logrus"
 )
 
@@ -70,162 +69,51 @@ func runServer() error {
 	handlers := mcp.NewHandlers(sshManager, logger)
 
 	// Create MCP server
-	mcpServer := server.NewMCPServer(
-		"mcp-ssh",
-		Version,
-		server.WithToolCapabilities(true),
-		server.WithLogging(),
-		server.WithRecovery(),
-	)
+	mcpServer := mcpsdk.NewServer(&mcpsdk.Implementation{
+		Name:    "mcp-ssh",
+		Version: Version,
+	}, nil)
 
-	// Define ssh_connect tool
-	connectTool := mcpgo.NewTool(
-		"ssh_connect",
-		mcpgo.WithDescription("Establish an SSH connection to a remote host"),
-		mcpgo.WithString("connection_id",
-			mcpgo.Required(),
-			mcpgo.Description("Unique identifier for this connection"),
-		),
-		mcpgo.WithString("host",
-			mcpgo.Required(),
-			mcpgo.Description("Remote host address (hostname or IP)"),
-		),
-		mcpgo.WithNumber("port",
-			mcpgo.Description("SSH port (default: 22)"),
-		),
-		mcpgo.WithString("username",
-			mcpgo.Required(),
-			mcpgo.Description("SSH username"),
-		),
-		mcpgo.WithString("password",
-			mcpgo.Description("SSH password (used for authentication or as passphrase for encrypted private keys)"),
-		),
-		mcpgo.WithString("private_key_path",
-			mcpgo.Description("Path to SSH private key file (optional if using password)"),
-		),
-	)
+	// Register tools
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_connect",
+		Description: "Establish an SSH connection to a remote host",
+	}, handlers.HandleConnect)
 
-	// Define ssh_execute tool
-	//nolint:dupl // ssh_execute and ssh_execute_async intentionally share similar parameters
-	executeTool := mcpgo.NewTool(
-		"ssh_execute",
-		mcpgo.WithDescription("Execute a command on an active SSH connection. Environment variables and working directory persist between commands."),
-		mcpgo.WithString("connection_id",
-			mcpgo.Required(),
-			mcpgo.Description("Connection identifier"),
-		),
-		mcpgo.WithString("command",
-			mcpgo.Required(),
-			mcpgo.Description("Command to execute"),
-		),
-		mcpgo.WithNumber("max_lines",
-			mcpgo.Description("Maximum number of output lines (0 = unlimited)"),
-		),
-		mcpgo.WithNumber("max_bytes",
-			mcpgo.Description("Maximum number of output bytes (0 = unlimited)"),
-		),
-		mcpgo.WithBoolean("use_login_shell",
-			mcpgo.Description("Use login shell to source profiles (default: false)"),
-		),
-		mcpgo.WithBoolean("enable_pty",
-			mcpgo.Description("Allocate PTY for interactive apps like top, htop (default: false)"),
-		),
-		mcpgo.WithNumber("pty_cols",
-			mcpgo.Description("PTY columns (default: 80)"),
-		),
-		mcpgo.WithNumber("pty_rows",
-			mcpgo.Description("PTY rows (default: 24)"),
-		),
-	)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_execute",
+		Description: "Execute a command on an active SSH connection. Environment variables and working directory persist between commands.",
+	}, handlers.HandleExecute)
 
-	// Define ssh_execute_async tool
-	//nolint:dupl // ssh_execute and ssh_execute_async intentionally share similar parameters
-	executeAsyncTool := mcpgo.NewTool(
-		"ssh_execute_async",
-		mcpgo.WithDescription("Execute a command asynchronously and get a job ID for polling status"),
-		mcpgo.WithString("connection_id",
-			mcpgo.Required(),
-			mcpgo.Description("Connection identifier"),
-		),
-		mcpgo.WithString("command",
-			mcpgo.Required(),
-			mcpgo.Description("Command to execute"),
-		),
-		mcpgo.WithNumber("max_lines",
-			mcpgo.Description("Maximum number of output lines (0 = unlimited)"),
-		),
-		mcpgo.WithNumber("max_bytes",
-			mcpgo.Description("Maximum number of output bytes (0 = unlimited)"),
-		),
-		mcpgo.WithBoolean("use_login_shell",
-			mcpgo.Description("Use login shell to source profiles (default: false)"),
-		),
-		mcpgo.WithBoolean("enable_pty",
-			mcpgo.Description("Allocate PTY for interactive apps (default: false)"),
-		),
-		mcpgo.WithNumber("pty_cols",
-			mcpgo.Description("PTY columns (default: 80)"),
-		),
-		mcpgo.WithNumber("pty_rows",
-			mcpgo.Description("PTY rows (default: 24)"),
-		),
-	)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_execute_async",
+		Description: "Execute a command asynchronously and get a job ID for polling status",
+	}, handlers.HandleExecuteAsync)
 
-	// Define ssh_job_status tool
-	jobStatusTool := mcpgo.NewTool(
-		"ssh_job_status",
-		mcpgo.WithDescription("Get the status of an asynchronous job"),
-		mcpgo.WithString("job_id",
-			mcpgo.Required(),
-			mcpgo.Description("Job identifier returned by ssh_execute_async"),
-		),
-	)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_job_status",
+		Description: "Get the status of an asynchronous job",
+	}, handlers.HandleJobStatus)
 
-	// Define ssh_job_cancel tool
-	jobCancelTool := mcpgo.NewTool(
-		"ssh_job_cancel",
-		mcpgo.WithDescription("Cancel a running job"),
-		mcpgo.WithString("job_id",
-			mcpgo.Required(),
-			mcpgo.Description("Job identifier to cancel"),
-		),
-	)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_job_cancel",
+		Description: "Cancel a running job",
+	}, handlers.HandleJobCancel)
 
-	// Define ssh_job_list tool
-	jobListTool := mcpgo.NewTool(
-		"ssh_job_list",
-		mcpgo.WithDescription("List all jobs for a connection"),
-		mcpgo.WithString("connection_id",
-			mcpgo.Required(),
-			mcpgo.Description("Connection identifier"),
-		),
-	)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_job_list",
+		Description: "List all jobs for a connection",
+	}, handlers.HandleJobList)
 
-	// Define ssh_close tool
-	closeTool := mcpgo.NewTool(
-		"ssh_close",
-		mcpgo.WithDescription("Close an active SSH connection"),
-		mcpgo.WithString("connection_id",
-			mcpgo.Required(),
-			mcpgo.Description("Connection identifier to close"),
-		),
-	)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_close",
+		Description: "Close an active SSH connection",
+	}, handlers.HandleClose)
 
-	// Define ssh_list tool
-	listTool := mcpgo.NewTool(
-		"ssh_list",
-		mcpgo.WithDescription("List all active SSH connections"),
-	)
-
-	// Add tools to server
-	mcpServer.AddTool(connectTool, handlers.HandleConnect)
-	mcpServer.AddTool(executeTool, handlers.HandleExecute)
-	mcpServer.AddTool(executeAsyncTool, handlers.HandleExecuteAsync)
-	mcpServer.AddTool(jobStatusTool, handlers.HandleJobStatus)
-	mcpServer.AddTool(jobCancelTool, handlers.HandleJobCancel)
-	mcpServer.AddTool(jobListTool, handlers.HandleJobList)
-	mcpServer.AddTool(closeTool, handlers.HandleClose)
-	mcpServer.AddTool(listTool, handlers.HandleList)
+	mcpsdk.AddTool(mcpServer, &mcpsdk.Tool{
+		Name:        "ssh_list",
+		Description: "List all active SSH connections",
+	}, handlers.HandleList)
 
 	logger.Info("MCP tools registered")
 
@@ -251,12 +139,11 @@ func runServer() error {
 
 	// Start MCP server with stdio transport
 	logger.Info("Starting MCP server on stdio transport")
-	if err := server.ServeStdio(mcpServer); err != nil {
+	if err := mcpServer.Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
 		logger.WithError(err).Error("Server error")
 		return err
 	}
 
-	<-ctx.Done()
 	logger.Info("MCP SSH Server stopped")
 	return nil
 }

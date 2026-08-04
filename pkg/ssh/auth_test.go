@@ -181,13 +181,11 @@ func TestBuildAuthMethods(t *testing.T) {
 		password    string
 		wantMethods int
 		wantErr     bool
-		wantUsed    []string
 	}{
 		{
 			name:        "password only",
 			password:    "secret",
 			wantMethods: 1,
-			wantUsed:    []string{"password"},
 		},
 		{
 			name:        "explicit unencrypted key",
@@ -233,7 +231,6 @@ func TestBuildAuthMethods(t *testing.T) {
 			files:       map[string][]byte{"id_ed25519": []byte("garbage")},
 			password:    "secret",
 			wantMethods: 1,
-			wantUsed:    []string{"password"},
 		},
 		{
 			name:    "nothing at all errors",
@@ -251,20 +248,20 @@ func TestBuildAuthMethods(t *testing.T) {
 			opts := AuthOptions{
 				Password: tt.password,
 				SSHDir:   dir,
-				UseAgent: false,
+				UseAgent: boolPtr(false),
 			}
 			if tt.explicitKey != "" {
 				opts.PrivateKeyPath = filepath.Join(dir, tt.explicitKey)
 			}
 
-			methods, cleanup, used, err := buildAuthMethods(opts)
+			methods, cleanup, err := buildAuthMethods(opts)
 			if cleanup != nil {
 				defer cleanup()
 			}
 
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("expected error, got methods=%v used=%v", len(methods), used)
+					t.Fatalf("expected error, got %d methods", len(methods))
 				}
 				return
 			}
@@ -272,17 +269,7 @@ func TestBuildAuthMethods(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if len(methods) != tt.wantMethods {
-				t.Fatalf("got %d auth methods (used=%v), want %d", len(methods), used, tt.wantMethods)
-			}
-			if tt.wantUsed != nil {
-				if len(used) != len(tt.wantUsed) {
-					t.Fatalf("got used=%v, want %v", used, tt.wantUsed)
-				}
-				for i, u := range tt.wantUsed {
-					if used[i] != u {
-						t.Errorf("used[%d] = %q, want %q", i, used[i], u)
-					}
-				}
+				t.Fatalf("got %d auth methods, want %d", len(methods), tt.wantMethods)
 			}
 		})
 	}
@@ -293,9 +280,9 @@ func TestBuildAuthMethodsAgentUnavailable(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "id_ed25519"), newTestKeyPEM(t))
 
 	// A socket path that does not exist must not break the connection setup.
-	methods, cleanup, _, err := buildAuthMethods(AuthOptions{
+	methods, cleanup, err := buildAuthMethods(AuthOptions{
 		SSHDir:      dir,
-		UseAgent:    true,
+		UseAgent:    boolPtr(true),
 		AgentSocket: filepath.Join(dir, "nonexistent.sock"),
 	})
 	if cleanup != nil {
@@ -308,3 +295,6 @@ func TestBuildAuthMethodsAgentUnavailable(t *testing.T) {
 		t.Fatalf("got %d methods, want 1 (key only)", len(methods))
 	}
 }
+
+// boolPtr returns a pointer to b, for AuthOptions.UseAgent.
+func boolPtr(b bool) *bool { return &b }

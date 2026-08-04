@@ -1,7 +1,6 @@
 package ssh
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -38,8 +37,9 @@ type AuthOptions struct {
 	// PrivateKeyPath is an explicit private key file (alias: identity_file).
 	PrivateKeyPath string
 
-	// UseAgent enables the SSH agent auth method when SSH_AUTH_SOCK is set.
-	UseAgent bool
+	// UseAgent enables the SSH agent auth method. Nil means "auto": use the
+	// agent whenever SSH_AUTH_SOCK is set.
+	UseAgent *bool
 
 	// SSHDir overrides the directory scanned for default keys (test hook).
 	// Empty means ~/.ssh.
@@ -47,6 +47,25 @@ type AuthOptions struct {
 
 	// AgentSocket overrides $SSH_AUTH_SOCK (test hook).
 	AgentSocket string
+}
+
+// agentSocket resolves the agent socket to dial, honouring UseAgent.
+func (o AuthOptions) agentSocket() string {
+	if o.UseAgent != nil && !*o.UseAgent {
+		return ""
+	}
+	if o.AgentSocket != "" {
+		return o.AgentSocket
+	}
+	return os.Getenv("SSH_AUTH_SOCK")
+}
+
+// sshDir resolves the directory scanned for default keys.
+func (o AuthOptions) sshDir() string {
+	if o.SSHDir != "" {
+		return o.SSHDir
+	}
+	return defaultSSHDir()
 }
 
 // defaultSSHDir returns the directory that holds the user's SSH keys.
@@ -118,12 +137,8 @@ func agentAuthMethod(socket string) (ssh.AuthMethod, func() error) {
 	if socket == "" {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), agentDialTimeout)
-	defer cancel()
-
-	var dialer net.Dialer
 	// #nosec G704 - the socket path is the local SSH_AUTH_SOCK, not remote input
-	conn, err := dialer.DialContext(ctx, "unix", socket)
+	conn, err := net.DialTimeout("unix", socket, agentDialTimeout)
 	if err != nil {
 		return nil, nil
 	}
@@ -133,52 +148,39 @@ func agentAuthMethod(socket string) (ssh.AuthMethod, func() error) {
 
 // buildAuthMethods assembles the SSH auth methods for the given options.
 // Order: agent (if available) -> explicit key -> discovered default keys ->
-// password. It also returns a cleanup func (never nil) and a human-readable
-// description of what was used.
-func buildAuthMethods(opts AuthOptions) ([]ssh.AuthMethod, func(), []string, error) {
+// password. It also returns a cleanup func (never nil).
+func buildAuthMethods(opts AuthOptions) ([]ssh.AuthMethod, func(), error) {
 	var (
-		methods []ssh.AuthMethod
-		closers []func() error
-		used    []string
+		methods   []ssh.AuthMethod
+		agentConn func() error
 	)
 	cleanup := func() {
-		for _, c := range closers {
+		if agentConn != nil {
 			//nolint:errcheck // Best effort cleanup
-			_ = c()
+			_ = agentConn()
 		}
 	}
 
-	if opts.UseAgent {
-		socket := opts.AgentSocket
-		if socket == "" {
-			socket = os.Getenv("SSH_AUTH_SOCK")
-		}
-		if method, closer := agentAuthMethod(socket); method != nil {
-			methods = append(methods, method)
-			used = append(used, "agent")
-			if closer != nil {
-				closers = append(closers, closer)
-			}
-		}
+	if method, closer := agentAuthMethod(opts.agentSocket()); method != nil {
+		methods = append(methods, method)
+		agentConn = closer
 	}
 
-	if opts.PrivateKeyPath != "" {
+	switch {
+	case opts.PrivateKeyPath != "":
 		signer, err := loadSignerFromFile(opts.PrivateKeyPath, opts.Password)
 		if err != nil {
 			cleanup()
 			if errors.Is(err, ErrKeyEncrypted) {
-				return nil, func() {}, nil, fmt.Errorf(
+				return nil, func() {}, fmt.Errorf(
 					"private key '%s' is encrypted: provide the passphrase in the 'password' field", opts.PrivateKeyPath)
 			}
-			return nil, func() {}, nil, err
+			return nil, func() {}, err
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
-		used = append(used, "key:"+opts.PrivateKeyPath)
-	} else {
-		sshDir := opts.SSHDir
-		if sshDir == "" {
-			sshDir = defaultSSHDir()
-		}
+
+	default:
+		sshDir := opts.sshDir()
 		var signers []ssh.Signer
 		for _, path := range DiscoverKeyFiles(sshDir) {
 			signer, err := loadSignerFromFile(path, opts.Password)
@@ -187,7 +189,6 @@ func buildAuthMethods(opts AuthOptions) ([]ssh.AuthMethod, func(), []string, err
 				continue
 			}
 			signers = append(signers, signer)
-			used = append(used, "key:"+path)
 		}
 		if len(signers) > 0 {
 			methods = append(methods, ssh.PublicKeys(signers...))
@@ -196,15 +197,14 @@ func buildAuthMethods(opts AuthOptions) ([]ssh.AuthMethod, func(), []string, err
 
 	if opts.Password != "" {
 		methods = append(methods, ssh.Password(opts.Password))
-		used = append(used, "password")
 	}
 
 	if len(methods) == 0 {
 		cleanup()
-		return nil, func() {}, nil, fmt.Errorf(
+		return nil, func() {}, fmt.Errorf(
 			"no authentication method available: provide 'password' or 'private_key_path', " +
 				"start an SSH agent (SSH_AUTH_SOCK), or place a usable key in ~/.ssh")
 	}
 
-	return methods, cleanup, used, nil
+	return methods, cleanup, nil
 }

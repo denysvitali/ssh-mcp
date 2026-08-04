@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/denysvitali/ssh-mcp/pkg/ssh"
@@ -51,15 +50,10 @@ func (in ConnectInput) authOptions() ssh.AuthOptions {
 		keyPath = in.IdentityFile
 	}
 
-	useAgent := os.Getenv("SSH_AUTH_SOCK") != ""
-	if in.UseAgent != nil {
-		useAgent = *in.UseAgent
-	}
-
 	return ssh.AuthOptions{
 		Password:       in.Password,
 		PrivateKeyPath: keyPath,
-		UseAgent:       useAgent,
+		UseAgent:       in.UseAgent,
 	}
 }
 
@@ -171,7 +165,7 @@ func validateCommand(cmd string) error {
 // HandleConnect handles the ssh_connect tool
 func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in ConnectInput) (*mcp.CallToolResult, any, error) {
 	if err := validateConnectionID(in.ConnectionID); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 
 	if strings.TrimSpace(in.Host) == "" {
@@ -187,7 +181,7 @@ func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in C
 		port = 22
 	}
 	if err := validatePort(port); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 
 	// No explicit credentials is allowed: the manager falls back to the SSH
@@ -221,10 +215,10 @@ func (h *Handlers) HandleConnect(_ context.Context, _ *mcp.CallToolRequest, in C
 // HandleExecute handles the ssh_execute tool
 func (h *Handlers) HandleExecute(_ context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, any, error) {
 	if err := validateConnectionID(in.ConnectionID); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 	if err := validateCommand(in.Command); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 
 	opts := in.toOptions()
@@ -262,10 +256,10 @@ func (h *Handlers) HandleExecute(_ context.Context, _ *mcp.CallToolRequest, in E
 // HandleExecuteAsync handles the ssh_execute_async tool
 func (h *Handlers) HandleExecuteAsync(_ context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, any, error) {
 	if err := validateConnectionID(in.ConnectionID); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 	if err := validateCommand(in.Command); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
@@ -363,7 +357,7 @@ func (h *Handlers) HandleJobCancel(_ context.Context, _ *mcp.CallToolRequest, in
 // HandleJobList handles the ssh_job_list tool
 func (h *Handlers) HandleJobList(_ context.Context, _ *mcp.CallToolRequest, in ConnectionInput) (*mcp.CallToolResult, any, error) {
 	if err := validateConnectionID(in.ConnectionID); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{
@@ -399,7 +393,7 @@ func (h *Handlers) HandleJobList(_ context.Context, _ *mcp.CallToolRequest, in C
 // HandleClose handles the ssh_close tool
 func (h *Handlers) HandleClose(_ context.Context, _ *mcp.CallToolRequest, in ConnectionInput) (*mcp.CallToolResult, any, error) {
 	if err := validateConnectionID(in.ConnectionID); err != nil {
-		return errorResult("%s", err.Error()), nil, nil
+		return errorResult("%v", err), nil, nil
 	}
 
 	h.logger.WithFields(logrus.Fields{

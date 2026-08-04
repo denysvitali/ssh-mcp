@@ -100,6 +100,14 @@ func NewManager(validator *HostValidator, timeout time.Duration) *Manager {
 // options. When no explicit credentials are supplied the SSH agent and the
 // default keys in ~/.ssh are used.
 func (m *Manager) Connect(id, host string, port int, username string, auth AuthOptions) error {
+	// Build authentication methods (agent, explicit key, discovered keys,
+	// password) before taking the lock: it does blocking I/O.
+	authMethods, cleanupAuth, err := buildAuthMethods(auth)
+	if err != nil {
+		return err
+	}
+	defer cleanupAuth()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -117,13 +125,6 @@ func (m *Manager) Connect(id, host string, port int, username string, auth AuthO
 	if err := m.validator.Validate(host); err != nil {
 		return err
 	}
-
-	// Build authentication methods (agent, explicit key, discovered keys, password)
-	authMethods, cleanupAuth, _, err := buildAuthMethods(auth)
-	if err != nil {
-		return err
-	}
-	defer cleanupAuth()
 
 	// Prepare SSH config
 	// Use InsecureIgnoreHostKey for now but this should be configurable in production

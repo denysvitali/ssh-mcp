@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -49,7 +50,7 @@ type AuthOptions struct {
 	AgentSocket string
 }
 
-// agentSocket resolves the agent socket to dial, honouring UseAgent.
+// agentSocket resolves the agent socket to dial, honoring UseAgent.
 func (o AuthOptions) agentSocket() string {
 	if o.UseAgent != nil && !*o.UseAgent {
 		return ""
@@ -137,8 +138,12 @@ func agentAuthMethod(socket string) (ssh.AuthMethod, func() error) {
 	if socket == "" {
 		return nil, nil
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), agentDialTimeout)
+	defer cancel()
+
+	var dialer net.Dialer
 	// #nosec G704 - the socket path is the local SSH_AUTH_SOCK, not remote input
-	conn, err := net.DialTimeout("unix", socket, agentDialTimeout)
+	conn, err := dialer.DialContext(ctx, "unix", socket)
 	if err != nil {
 		return nil, nil
 	}

@@ -122,8 +122,8 @@ func (m *Manager) Connect(id, host string, port int, username string, auth AuthO
 	}
 
 	// Validate host
-	if err := m.validator.Validate(host); err != nil {
-		return err
+	if validateErr := m.validator.Validate(host); validateErr != nil {
+		return validateErr
 	}
 
 	// Prepare SSH config

@@ -119,6 +119,9 @@ Executes a command on an active connection. The shell state (cwd, environment) p
 - `enable_pty` (boolean, optional) - Allocate PTY for interactive apps (default: false)
 - `pty_cols` (number, optional) - PTY columns (default: 80)
 - `pty_rows` (number, optional) - PTY rows (default: 24)
+- `timeout_seconds` (number, optional) - Command timeout (default: `--command-timeout`)
+
+Commands run with stdin redirected from `/dev/null`. If a command times out, its partial output is returned with `timed_out: true`; when the next command arrives and the timed-out one is still running, the shell is replaced with a fresh one (cwd and environment reset) and `warning` says so.
 
 **Response:**
 ```json
@@ -130,7 +133,8 @@ Executes a command on an active connection. The shell state (cwd, environment) p
   "signal": 0,
   "signal_name": "",
   "timed_out": false,
-  "binary_output": false
+  "binary_output": false,
+  "warning": ""
 }
 ```
 

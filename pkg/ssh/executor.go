@@ -1,29 +1,33 @@
 package ssh
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
 const (
-	// Shell initialization timeouts
-	shellInitialDrainDelay = 500 * time.Millisecond
-	shellInitCommandDelay  = 200 * time.Millisecond
-	shellPromptTimeout     = 2 * time.Second
+	// Maximum time to wait for a new shell to answer its ready marker
+	shellReadyTimeout = 15 * time.Second
 
 	// Default command execution timeout
 	DefaultCommandTimeout = 30 * time.Second
 
-	// Read timeouts
-	stderrReadTimeout = 100 * time.Millisecond
-	pollInterval      = 10 * time.Millisecond
+	// How long to wait for the stderr marker once stdout has completed
+	stderrGracePeriod = 500 * time.Millisecond
+
+	// Completion marker printed after every command
+	markerPrefix     = "__MCP_SSH_END_"
+	markerCodeMaxLen = 16
+
+	// Highest signal number reported for exit codes above 128
+	maxSignal = 64
 
 	// Binary detection
 	binarySampleSize = 8192
@@ -32,12 +36,13 @@ const (
 
 // ExecuteOptions controls command execution behavior
 type ExecuteOptions struct {
-	MaxLines      int  // Maximum output lines (0 = unlimited)
-	MaxBytes      int  // Maximum output bytes (0 = unlimited)
-	UseLoginShell bool // If true, use login shell (-l) to source profiles
-	EnablePTY     bool // If true, allocate PTY for interactive apps
-	PtyCols       uint // PTY columns (default: 80)
-	PtyRows       uint // PTY rows (default: 24)
+	MaxLines      int           // Maximum output lines (0 = unlimited)
+	MaxBytes      int           // Maximum output bytes (0 = unlimited)
+	UseLoginShell bool          // If true, use login shell (-l) to source profiles
+	EnablePTY     bool          // If true, allocate PTY for interactive apps
+	PtyCols       uint          // PTY columns (default: 80)
+	PtyRows       uint          // PTY rows (default: 24)
+	Timeout       time.Duration // Command timeout (0 = executor default)
 }
 
 // CommandResult represents the result of a command execution
@@ -49,60 +54,170 @@ type CommandResult struct {
 	SignalName   string // Signal name e.g., "SIGSEGV", "SIGTERM"
 	TimedOut     bool   // True if command timed out
 	BinaryOutput bool   // True if output was binary and truncated
+	Warning      string // Out-of-band note about the shell session (e.g. it was restarted)
 }
 
-// SignalError represents a process killed by signal
-type SignalError struct {
-	Signal   int
-	Name     string
-	ExitCode int
-}
-
-func (e *SignalError) Error() string {
-	return fmt.Sprintf("process terminated by signal %d (%s)", e.Signal, e.Name)
-}
-
-// ShellExecutor manages a persistent shell session for executing commands
+// ShellExecutor manages a persistent shell session for executing commands.
+//
+// Output of the remote shell is continuously pumped into in-memory buffers by
+// exactly one goroutine per stream, for the whole lifetime of the shell. A
+// command's completion is detected by a unique marker printed after it on both
+// stdout and stderr. If a command times out, the shell is left running; the
+// next command either discards the late output (if the timed-out command has
+// finished meanwhile) or transparently replaces the shell with a fresh one.
 type ShellExecutor struct {
-	session        *ssh.Session
-	stdin          io.WriteCloser
-	stdout         *bufio.Reader
-	stderr         *bufio.Reader
-	mu             sync.Mutex
+	client         *ssh.Client
+	mu             sync.Mutex // serializes commands
 	commandTimeout time.Duration
-	isPty          bool
-	ptyCols        uint
-	ptyRows        uint
+
+	stateMu sync.Mutex // guards shell, closed
+	shell   *shellSession
+	closed  bool
+
+	// pending is the marker of a timed-out command whose completion has not
+	// been observed yet. Only accessed with mu held.
+	pending string
+
+	isPty   bool
+	ptyCols uint
+	ptyRows uint
+}
+
+// shellSession is one remote shell process together with its output buffers
+type shellSession struct {
+	session   *ssh.Session
+	stdin     io.WriteCloser
+	stdout    *streamBuffer
+	stderr    *streamBuffer
+	notify    chan struct{} // signaled whenever either stream changes
+	closeOnce sync.Once
+}
+
+// streamBuffer accumulates everything read from a stream until reset
+type streamBuffer struct {
+	mu      sync.Mutex
+	buf     []byte
+	scanned int // offset up to which marker search has been done
+	err     error
+	notify  chan<- struct{}
+}
+
+func newStreamBuffer(r io.Reader, notify chan<- struct{}) *streamBuffer {
+	s := &streamBuffer{notify: notify}
+	go s.pump(r)
+	return s
+}
+
+func (s *streamBuffer) pump(r io.Reader) {
+	chunk := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(chunk)
+		s.mu.Lock()
+		s.buf = append(s.buf, chunk[:n]...)
+		if err != nil {
+			s.err = err
+		}
+		s.mu.Unlock()
+		select {
+		case s.notify <- struct{}{}:
+		default:
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// findMarker looks for a complete "<marker>:<code>\n" line. It returns the
+// output preceding the marker (without the newline the marker line starts
+// with) and the parsed exit code.
+func (s *streamBuffer) findMarker(marker string) (output string, code int, found bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	from := max(0, s.scanned-len(marker)-markerCodeMaxLen)
+	idx := bytes.Index(s.buf[from:], []byte(marker+":"))
+	if idx < 0 {
+		s.scanned = len(s.buf)
+		return "", 0, false
+	}
+	idx += from
+	rest := s.buf[idx+len(marker)+1:]
+	eol := bytes.IndexByte(rest, '\n')
+	if eol < 0 {
+		s.scanned = idx
+		return "", 0, false
+	}
+	//nolint:errcheck // Exit code parsing failure is reported as 0
+	_, _ = fmt.Sscanf(strings.TrimSpace(string(rest[:eol])), "%d", &code)
+
+	out := s.buf[:idx]
+	out = bytes.TrimSuffix(out, []byte("\n"))
+	out = bytes.TrimSuffix(out, []byte("\r"))
+	return string(out), code, true
+}
+
+// snapshot returns the current buffer contents and terminal read error
+func (s *streamBuffer) snapshot() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.buf), s.err
+}
+
+// text returns the current buffer contents
+func (s *streamBuffer) text() string {
+	out, _ := s.snapshot() //nolint:errcheck // Only the contents are needed
+	return out
+}
+
+// reset discards buffered output
+func (s *streamBuffer) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf = nil
+	s.scanned = 0
 }
 
 // NewShellExecutor creates a new persistent shell executor
 func NewShellExecutor(client *ssh.Client, timeout time.Duration) (*ShellExecutor, error) {
+	if timeout <= 0 {
+		timeout = DefaultCommandTimeout
+	}
+	executor := &ShellExecutor{
+		client:         client,
+		commandTimeout: timeout,
+	}
+	shell, err := startShell(client)
+	if err != nil {
+		return nil, err
+	}
+	executor.shell = shell
+	return executor, nil
+}
+
+// startShell opens a new session running the user's shell and waits until
+// the shell is ready to accept commands
+func startShell(client *ssh.Client) (*shellSession, error) {
 	session, err := client.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
-	// Set a reasonable timeout for the session
 	//nolint:errcheck // Non-fatal error, TERM variable is optional
 	_ = session.Setenv("TERM", "dumb")
 
-	// Get stdin pipe
 	stdin, err := session.StdinPipe()
 	if err != nil {
 		//nolint:errcheck // Best effort cleanup
 		_ = session.Close()
 		return nil, fmt.Errorf("failed to get stdin pipe: %w", err)
 	}
-
-	// Get stdout pipe
 	stdoutPipe, err := session.StdoutPipe()
 	if err != nil {
 		//nolint:errcheck // Best effort cleanup
 		_ = session.Close()
 		return nil, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
-
-	// Get stderr pipe
 	stderrPipe, err := session.StderrPipe()
 	if err != nil {
 		//nolint:errcheck // Best effort cleanup
@@ -110,76 +225,91 @@ func NewShellExecutor(client *ssh.Client, timeout time.Duration) (*ShellExecutor
 		return nil, fmt.Errorf("failed to get stderr pipe: %w", err)
 	}
 
-	// Start shell
 	if err := session.Shell(); err != nil {
 		//nolint:errcheck // Best effort cleanup
 		_ = session.Close()
 		return nil, fmt.Errorf("failed to start shell: %w", err)
 	}
 
-	executor := &ShellExecutor{
-		session:        session,
-		stdin:          stdin,
-		stdout:         bufio.NewReader(stdoutPipe),
-		stderr:         bufio.NewReader(stderrPipe),
-		commandTimeout: timeout,
+	notify := make(chan struct{}, 1)
+	shell := &shellSession{
+		session: session,
+		stdin:   stdin,
+		stdout:  newStreamBuffer(stdoutPipe, notify),
+		stderr:  newStreamBuffer(stderrPipe, notify),
+		notify:  notify,
 	}
 
-	// Wait for initial shell output
-	time.Sleep(shellInitialDrainDelay)
-	executor.drainOutput()
-
-	// Try to set up the shell for clean output
-	// Use a simpler approach that's more compatible with different shells
-	initCommands := []string{
+	// Set up the shell for clean output, then wait for a ready marker so
+	// that banners and init noise never leak into the first command.
+	marker := newMarker()
+	init := strings.Join([]string{
 		"stty -echo 2>/dev/null || true",           // Disable echo if available
 		"export PS1='' 2>/dev/null || true",        // Empty prompt if available
 		"unset PROMPT_COMMAND 2>/dev/null || true", // Disable prompt command
 		"set +o vi 2>/dev/null || true",            // Disable vi mode
+		markerCommand(marker, "0", ""),
+	}, "\n") + "\n"
+	if _, err := stdin.Write([]byte(init)); err != nil {
+		shell.close()
+		return nil, fmt.Errorf("failed to initialize shell: %w", err)
 	}
 
-	// Execute init commands one by one to handle failures gracefully
-	for _, cmd := range initCommands {
-		if _, err := stdin.Write([]byte(cmd + "\n")); err != nil {
-			//nolint:errcheck // Best effort cleanup
-			_ = session.Close()
-			return nil, fmt.Errorf("failed to initialize shell: %w", err)
+	timer := time.NewTimer(shellReadyTimeout)
+	defer timer.Stop()
+	for {
+		if _, _, found := shell.stdout.findMarker(marker); found {
+			shell.stdout.reset()
+			shell.stderr.reset()
+			return shell, nil
 		}
-		time.Sleep(shellInitCommandDelay)
-		executor.drainOutput()
+		if _, err := shell.stdout.snapshot(); err != nil {
+			shell.close()
+			return nil, fmt.Errorf("shell exited during initialization: %w", err)
+		}
+		select {
+		case <-notify:
+		case <-timer.C:
+			shell.close()
+			return nil, fmt.Errorf("shell did not become ready within %s", shellReadyTimeout)
+		}
 	}
+}
 
-	// Wait for shell to be ready by sending a simple command and waiting for response
-	readyDelim := "__MCP_READY__"
-	if _, err := stdin.Write([]byte("echo " + readyDelim + "\n")); err != nil {
+// close terminates the shell session; safe to call from several goroutines.
+// Closing the session is enough: stdin.Close (CloseWrite) races with a
+// concurrent Write inside x/crypto/ssh.
+func (s *shellSession) close() {
+	s.closeOnce.Do(func() {
 		//nolint:errcheck // Best effort cleanup
-		_ = session.Close()
-		return nil, fmt.Errorf("failed to send ready check: %w", err)
-	}
+		_ = s.session.Close()
+	})
+}
 
-	// Wait for the ready response with timeout
-	readyChan := make(chan string, 1)
-	go func() {
-		var output strings.Builder
-		deadline := time.Now().Add(shellPromptTimeout)
-		for time.Now().Before(deadline) {
-			line, err := executor.stdout.ReadString('\n')
-			if err != nil {
-				break
-			}
-			output.WriteString(line)
-			if strings.Contains(line, readyDelim) {
-				readyChan <- output.String()
-				return
-			}
-		}
-		readyChan <- ""
-	}()
+// markerCounter makes markers unique even within the same nanosecond
+var markerCounter atomic.Uint64
 
-	// Don't block on ready check - just drain and continue
-	executor.drainOutput()
+// newMarker returns a unique completion marker
+func newMarker() string {
+	return fmt.Sprintf("%s%d_%d__", markerPrefix, time.Now().UnixNano(), markerCounter.Add(1))
+}
 
-	return executor, nil
+// markerCommand returns a shell line printing "\n<marker>:<code>" on the given
+// redirection. The marker is passed to printf in two halves so that an echo of
+// the command line itself (e.g. with a PTY) never contains the marker.
+func markerCommand(marker, code, redirect string) string {
+	return fmt.Sprintf("printf '\\n%%s%%s:%%s\\n' '%s' '%s' \"%s\"%s",
+		marker[:len(markerPrefix)], marker[len(markerPrefix):], code, redirect)
+}
+
+// prepareCommand wraps the command so that it cannot consume the shell's own
+// input (stdin is /dev/null) and is followed by completion markers on stderr
+// and stdout carrying its exit code
+func prepareCommand(command, marker string) string {
+	return "{\n" + command + "\n} </dev/null\n" +
+		"__mcp_ec=$?\n" +
+		markerCommand(marker, "$__mcp_ec", " >&2") + "\n" +
+		markerCommand(marker, "$__mcp_ec", "") + "\n"
 }
 
 // Execute runs a command in the persistent shell and returns the result
@@ -189,7 +319,7 @@ func (e *ShellExecutor) Execute(command string) (*CommandResult, error) {
 }
 
 // allocatePty allocates a PTY for the session if not already allocated
-func (e *ShellExecutor) allocatePty(opts ExecuteOptions) error {
+func (e *ShellExecutor) allocatePty(shell *shellSession, opts ExecuteOptions) error {
 	if !opts.EnablePTY || e.isPty {
 		return nil
 	}
@@ -208,7 +338,7 @@ func (e *ShellExecutor) allocatePty(opts ExecuteOptions) error {
 		ssh.TTY_OP_ISPEED: 115200,
 		ssh.TTY_OP_OSPEED: 115200,
 	}
-	if err := e.session.RequestPty("xterm-256color", int(cols), int(rows), modes); err != nil {
+	if err := shell.session.RequestPty("xterm-256color", int(cols), int(rows), modes); err != nil {
 		return fmt.Errorf("failed to request PTY: %w", err)
 	}
 	e.isPty = true
@@ -217,17 +347,68 @@ func (e *ShellExecutor) allocatePty(opts ExecuteOptions) error {
 	return nil
 }
 
-// prepareCommand wraps the command with delimiter and exit code capture
-func prepareCommand(command, delimiter string) string {
-	return fmt.Sprintf("%s\necho \"%s:$?\"\n", command, delimiter)
+// currentShell returns a shell ready for the next command, replacing a dead
+// shell or one still busy with a timed-out command. Must be called with mu held.
+func (e *ShellExecutor) currentShell() (*shellSession, string, error) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+
+	if e.closed {
+		return nil, "", fmt.Errorf("shell executor is closed")
+	}
+
+	var warning string
+	if e.shell != nil && e.pending != "" {
+		if _, _, found := e.shell.stdout.findMarker(e.pending); found {
+			// The timed-out command has finished meanwhile; its output is stale.
+			e.pending = ""
+		} else {
+			e.shell.close()
+			e.shell = nil
+			warning = "the previous command timed out and was still running, so a new shell was started " +
+				"(working directory and environment variables were reset)"
+		}
+	}
+	if e.shell != nil {
+		if _, err := e.shell.stdout.snapshot(); err != nil {
+			e.shell.close()
+			e.shell = nil
+			warning = "the previous shell had exited, so a new shell was started " +
+				"(working directory and environment variables were reset)"
+		}
+	}
+	if e.shell == nil {
+		e.pending = ""
+		e.isPty = false
+		shell, err := startShell(e.client)
+		if err != nil {
+			return nil, "", fmt.Errorf("shell session lost and could not be restarted "+
+				"(the SSH connection may be dead; reconnect with ssh_connect): %w", err)
+		}
+		e.shell = shell
+	}
+
+	// Drop anything printed since the last command, e.g. by background jobs.
+	e.shell.stdout.reset()
+	e.shell.stderr.reset()
+	return e.shell, warning, nil
 }
 
 // ExecuteWithOptions runs a command in the persistent shell with additional options
 func (e *ShellExecutor) ExecuteWithOptions(command string, opts ExecuteOptions) (*CommandResult, error) {
+	if strings.Contains(command, markerPrefix) {
+		return nil, fmt.Errorf("command contains forbidden delimiter pattern '%s'", markerPrefix)
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.allocatePty(opts); err != nil {
+	shell, warning, err := e.currentShell()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := e.allocatePty(shell, opts); err != nil {
 		return nil, err
 	}
 
@@ -235,214 +416,126 @@ func (e *ShellExecutor) ExecuteWithOptions(command string, opts ExecuteOptions) 
 		command = "bash -l -c " + escapeForShell(command)
 	}
 
-	delimiter := fmt.Sprintf("__MCP_SSH_END_%d__", time.Now().UnixNano())
-
-	if strings.Contains(command, "__MCP_SSH_END_") {
-		return nil, fmt.Errorf("command contains forbidden delimiter pattern '__MCP_SSH_END_'")
-	}
-
-	fullCommand := prepareCommand(command, delimiter)
-
-	if _, err := e.stdin.Write([]byte(fullCommand)); err != nil {
+	marker := newMarker()
+	if _, err := shell.stdin.Write([]byte(prepareCommand(command, marker))); err != nil {
+		e.discardShell(shell)
 		return nil, fmt.Errorf("failed to write command: %w", err)
 	}
 
-	return e.collectOutput(delimiter, opts)
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = e.commandTimeout
+	}
+
+	result := e.collectOutput(shell, marker, timeout)
+	result.Warning = joinWarnings(warning, result.Warning)
+	return processOutput(result, opts), nil
 }
 
-// stdoutResult holds stdout reading results
-type stdoutResult struct {
-	output   string
-	exitCode int
-	err      error
+// discardShell closes the shell so the next command starts a fresh one
+func (e *ShellExecutor) discardShell(shell *shellSession) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	shell.close()
+	if e.shell == shell {
+		e.shell = nil
+	}
 }
 
-// stderrResult holds stderr reading results
-type stderrResult struct {
-	output string
-	err    error
-}
+// collectOutput waits until the command's markers show up on stdout and
+// stderr, the shell dies, or the timeout expires
+func (e *ShellExecutor) collectOutput(shell *shellSession, marker string, timeout time.Duration) *CommandResult {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
-// collectOutput reads stdout and stderr until command completion
-func (e *ShellExecutor) collectOutput(delimiter string, opts ExecuteOptions) (*CommandResult, error) {
-	stdoutChan := make(chan stdoutResult, 1)
-	stderrChan := make(chan stderrResult, 1)
-	doneChan := make(chan struct{})
+	var (
+		stdout     string
+		exitCode   int
+		stdoutDone bool
+		grace      <-chan time.Time
+	)
 
-	go func() {
-		output, code, err := e.readUntilDelimiter(e.stdout, delimiter)
-		stdoutChan <- stdoutResult{output: output, exitCode: code, err: err}
-		close(doneChan)
-	}()
-
-	go func() {
-		output, err := e.readStderrUntilDone(e.stderr, doneChan)
-		stderrChan <- stderrResult{output: output, err: err}
-	}()
-
-	timeout := time.After(e.commandTimeout)
-
-	var stdoutRes stdoutResult
-	var stderrRes stderrResult
-	var stdoutReceived, stderrReceived bool
-
-	for !stdoutReceived || !stderrReceived {
-		select {
-		case res := <-stdoutChan:
-			stdoutRes = res
-			stdoutReceived = true
-		case res := <-stderrChan:
-			stderrRes = res
-			stderrReceived = true
-		case <-timeout:
+	for {
+		if !stdoutDone {
+			stdout, exitCode, stdoutDone = shell.stdout.findMarker(marker)
+			if stdoutDone {
+				// The stderr marker is written first, so it is normally already
+				// here; only wait briefly in case fd 2 was redirected for good.
+				grace = time.After(stderrGracePeriod)
+			}
+		}
+		if stdoutDone {
+			if stderr, _, found := shell.stderr.findMarker(marker); found {
+				return &CommandResult{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
+			}
+		} else if out, err := shell.stdout.snapshot(); err != nil {
+			stderr := shell.stderr.text()
+			e.discardShell(shell)
 			return &CommandResult{
-				Stdout:   "",
-				Stderr:   "command execution timed out",
+				Stdout:   out,
+				Stderr:   stderr,
+				ExitCode: -1,
+				Warning: fmt.Sprintf("the shell session ended before the command completed (%v); "+
+					"a new shell will be started for the next command", err),
+			}
+		}
+
+		select {
+		case <-shell.notify:
+		case <-grace:
+			stderr := shell.stderr.text()
+			return &CommandResult{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
+		case <-timer.C:
+			out := shell.stdout.text()
+			stderr := shell.stderr.text()
+			e.pending = marker
+			return &CommandResult{
+				Stdout:   out,
+				Stderr:   stderr,
 				ExitCode: -1,
 				TimedOut: true,
-			}, nil
+				Warning: fmt.Sprintf("command timed out after %s and may still be running; "+
+					"if it has not finished by the next command, a new shell will be started", timeout),
+			}
 		}
 	}
-
-	return e.processOutput(stdoutRes, stderrRes, opts)
 }
 
-// processOutput handles output processing including signal errors, binary detection, and truncation
-func (e *ShellExecutor) processOutput(stdoutRes stdoutResult, stderrRes stderrResult, opts ExecuteOptions) (*CommandResult, error) {
-	stdoutStr := strings.TrimSpace(stdoutRes.output)
-	stderrStr := strings.TrimSpace(stderrRes.output)
-
-	if stdoutRes.err != nil {
-		if sigErr, ok := stdoutRes.err.(*SignalError); ok {
-			return &CommandResult{
-				Stdout:     stdoutStr,
-				Stderr:     stderrStr,
-				ExitCode:   sigErr.ExitCode,
-				Signal:     sigErr.Signal,
-				SignalName: sigErr.Name,
-			}, nil
+// joinWarnings combines non-empty warnings
+func joinWarnings(warnings ...string) string {
+	var parts []string
+	for _, w := range warnings {
+		if w != "" {
+			parts = append(parts, w)
 		}
-		return nil, fmt.Errorf("stdout read error: %w", stdoutRes.err)
 	}
-	if stderrRes.err != nil {
-		return nil, fmt.Errorf("stderr read error: %w", stderrRes.err)
+	return strings.Join(parts, "; ")
+}
+
+// processOutput handles signal detection, binary detection, and truncation
+func processOutput(result *CommandResult, opts ExecuteOptions) *CommandResult {
+	stdoutStr := strings.TrimSpace(result.Stdout)
+	result.Stderr = strings.TrimSpace(result.Stderr)
+
+	// Shells report death by signal N as exit status 128+N
+	if result.ExitCode > 128 && result.ExitCode <= 128+maxSignal {
+		result.Signal, result.SignalName = mapExitErrorToSignal(result.ExitCode)
 	}
 
-	binaryOutput := false
 	if opts.MaxBytes > 0 && len(stdoutStr) > opts.MaxBytes {
 		sampleSize := min(opts.MaxBytes, binarySampleSize)
 		if detectBinary([]byte(stdoutStr[:sampleSize])) {
-			binaryOutput = true
+			result.BinaryOutput = true
 		}
 	}
 
-	stdoutStr = truncateOutput(stdoutStr, opts.MaxLines, opts.MaxBytes)
-
-	return &CommandResult{
-		Stdout:       stdoutStr,
-		Stderr:       stderrStr,
-		ExitCode:     stdoutRes.exitCode,
-		BinaryOutput: binaryOutput,
-	}, nil
+	result.Stdout = truncateOutput(stdoutStr, opts.MaxLines, opts.MaxBytes)
+	return result
 }
 
 // escapeForShell wraps a command string in single quotes for safe shell execution
 func escapeForShell(cmd string) string {
 	return "'" + strings.ReplaceAll(cmd, "'", "'\\''") + "'"
-}
-
-// readUntilDelimiter reads from stdout until it finds the delimiter
-func (e *ShellExecutor) readUntilDelimiter(reader *bufio.Reader, delimiter string) (string, int, error) {
-	var output strings.Builder
-	var exitCode int
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return output.String(), exitCode, nil
-			}
-			// Check if this is an ExitError (process killed by signal)
-			if exitErr, ok := err.(*ssh.ExitError); ok {
-				signal, name := mapExitErrorToSignal(exitErr.ExitStatus())
-				return output.String(), exitErr.ExitStatus(), &SignalError{
-					Signal:   signal,
-					Name:     name,
-					ExitCode: exitErr.ExitStatus(),
-				}
-			}
-			return "", 0, err
-		}
-
-		// Check if this line contains the delimiter
-		if strings.Contains(line, delimiter) {
-			// Extract exit code from delimiter line (format: __DELIMITER__:123)
-			parts := strings.Split(line, ":")
-			if len(parts) == 2 {
-				//nolint:errcheck // Exit code parsing failure is handled by returning 0
-				_, _ = fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &exitCode)
-			}
-			return output.String(), exitCode, nil
-		}
-
-		output.WriteString(line)
-	}
-}
-
-// readStderrUntilDone reads stderr until the done channel is closed, then does a final drain
-func (e *ShellExecutor) readStderrUntilDone(reader *bufio.Reader, done <-chan struct{}) (string, error) {
-	var output strings.Builder
-
-	// Read stderr while command is running
-	for {
-		select {
-		case <-done:
-			// Command completed, do final drain with timeout
-			deadline := time.Now().Add(stderrReadTimeout)
-			for time.Now().Before(deadline) {
-				if reader.Buffered() > 0 {
-					line, err := reader.ReadString('\n')
-					if err != nil && err != io.EOF {
-						return output.String(), err
-					}
-					output.WriteString(line)
-					if err == io.EOF {
-						return output.String(), nil
-					}
-				} else {
-					time.Sleep(pollInterval)
-				}
-			}
-			return output.String(), nil
-		default:
-			// Check if data is available
-			if reader.Buffered() > 0 {
-				line, err := reader.ReadString('\n')
-				if err != nil && err != io.EOF {
-					return "", err
-				}
-				output.WriteString(line)
-				if err == io.EOF {
-					return output.String(), nil
-				}
-			} else {
-				time.Sleep(pollInterval)
-			}
-		}
-	}
-}
-
-// drainOutput drains any pending output from stdout and stderr
-func (e *ShellExecutor) drainOutput() {
-	// Non-blocking drain
-	for e.stdout.Buffered() > 0 {
-		//nolint:errcheck // Best effort drain, errors ignored
-		_, _ = e.stdout.ReadString('\n')
-	}
-	for e.stderr.Buffered() > 0 {
-		//nolint:errcheck // Best effort drain, errors ignored
-		_, _ = e.stderr.ReadString('\n')
-	}
 }
 
 // isPrintable checks if a byte is printable ASCII
@@ -525,19 +618,16 @@ func mapExitErrorToSignal(code int) (int, string) {
 	}
 }
 
-// Close closes the shell executor
+// Close closes the shell executor. It does not wait for a running command:
+// closing the session makes that command return immediately.
 func (e *ShellExecutor) Close() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
 
-	if e.stdin != nil {
-		//nolint:errcheck // Best effort cleanup
-		_ = e.stdin.Close()
+	e.closed = true
+	if e.shell != nil {
+		e.shell.close()
+		e.shell = nil
 	}
-
-	if e.session != nil {
-		return e.session.Close()
-	}
-
 	return nil
 }

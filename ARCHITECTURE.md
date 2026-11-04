@@ -82,23 +82,30 @@ err := validator.Validate("10.0.0.1")      // error (not allowed)
 
 1. **Session Creation**:
    - Creates SSH session with stdin/stdout/stderr pipes
-   - Starts interactive shell (`/bin/bash`)
-   - Drains initial shell output (prompt, etc.)
+   - Starts the user's shell
+   - Starts exactly one reader goroutine per stream that pumps output into an
+     in-memory buffer for the whole lifetime of the shell
+   - Sends init commands plus a ready marker and waits for it, so banners never
+     leak into the first command
 
 2. **Command Execution**:
    ```
    User Command: export FOO=bar
 
    Sent to Shell:
-   ┌─────────────────────────────────────┐
-   │ export FOO=bar                      │
-   │ echo "__MCP_SSH_END_123456__:$?"    │
-   └─────────────────────────────────────┘
+   ┌──────────────────────────────────────────────────────────────┐
+   │ {                                                            │
+   │ export FOO=bar                                               │
+   │ } </dev/null                  ← cannot swallow the markers   │
+   │ __mcp_ec=$?                                                  │
+   │ printf '\n%s%s:%s\n' '__MCP_SSH_END_' '123_1__' "$__mcp_ec" >&2 │
+   │ printf '\n%s%s:%s\n' '__MCP_SSH_END_' '123_1__' "$__mcp_ec"     │
+   └──────────────────────────────────────────────────────────────┘
 
-   Output Parsing:
+   Output Parsing (stdout and stderr each end with a marker):
    ┌─────────────────────────────────────┐
    │ [any command output]                │
-   │ __MCP_SSH_END_123456__:0            │ ← Delimiter + Exit Code
+   │ __MCP_SSH_END_123_1__:0             │ ← Marker + Exit Code
    └─────────────────────────────────────┘
 
    Returned to Client:
@@ -108,6 +115,15 @@ err := validator.Validate("10.0.0.1")      // error (not allowed)
      "exit_code": 0
    }
    ```
+
+   - The marker is split into two printf arguments so a PTY echo of the
+     command line never contains it.
+   - **Timeouts**: the partial output is returned with `timed_out: true` and the
+     shell is left running. If the command has finished by the next call, its
+     late output is discarded and the shell state is kept; otherwise the shell is
+     replaced with a fresh one and a `warning` explains that cwd/env were reset.
+   - **Shell exit** (e.g. `exit`, reboot): the partial output is returned with a
+     `warning`, and the next command starts a new shell on the same connection.
 
 3. **State Persistence**:
    - Same shell session = same environment
@@ -434,9 +450,8 @@ mcp-inspector ./mcp-ssh --allowed-hosts "localhost"
 
 1. **Host Key Verification**: Proper SSH host key checking
 2. **Connection Pooling**: Reuse connections across requests
-3. **Command Timeout**: Per-command execution timeout
-4. **Metrics**: Prometheus metrics export
-5. **File Transfer**: SCP/SFTP support
-6. **Port Forwarding**: SSH tunnel management
-7. **Jump Hosts**: Multi-hop SSH connections
-8. **Session Recording**: Audit trail of all commands
+3. **Metrics**: Prometheus metrics export
+4. **File Transfer**: SCP/SFTP support
+5. **Port Forwarding**: SSH tunnel management
+6. **Jump Hosts**: Multi-hop SSH connections
+7. **Session Recording**: Audit trail of all commands

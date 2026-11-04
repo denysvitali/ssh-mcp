@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/denysvitali/ssh-mcp/pkg/ssh"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -67,6 +68,7 @@ type ExecuteInput struct {
 	EnablePTY     bool   `json:"enable_pty,omitempty" jsonschema:"Allocate PTY for interactive apps like top, htop (default: false)"`
 	PtyCols       uint   `json:"pty_cols,omitempty" jsonschema:"PTY columns (default: 80)"`
 	PtyRows       uint   `json:"pty_rows,omitempty" jsonschema:"PTY rows (default: 24)"`
+	TimeoutSecs   int    `json:"timeout_seconds,omitempty" jsonschema:"Command timeout in seconds (default: server --command-timeout). Use a larger value for long-running commands"`
 }
 
 // JobInput is the input for job-scoped tools
@@ -91,6 +93,7 @@ func (in ExecuteInput) toOptions() ssh.ExecuteOptions {
 		EnablePTY:     in.EnablePTY,
 		PtyCols:       in.PtyCols,
 		PtyRows:       in.PtyRows,
+		Timeout:       time.Duration(in.TimeoutSecs) * time.Second,
 	}
 	if opts.PtyCols == 0 {
 		opts.PtyCols = 80
@@ -250,6 +253,7 @@ func (h *Handlers) HandleExecute(_ context.Context, _ *mcp.CallToolRequest, in E
 		"signal_name":   result.SignalName,
 		"timed_out":     result.TimedOut,
 		"binary_output": result.BinaryOutput,
+		"warning":       result.Warning,
 	}), nil, nil
 }
 
@@ -328,6 +332,7 @@ func (h *Handlers) HandleJobStatus(_ context.Context, _ *mcp.CallToolRequest, in
 			"signal_name":   result.SignalName,
 			"timed_out":     result.TimedOut,
 			"binary_output": result.BinaryOutput,
+			"warning":       result.Warning,
 		}
 	}
 

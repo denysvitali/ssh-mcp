@@ -2,7 +2,7 @@
 
 A Model Context Protocol (MCP) server that provides AI agents with persistent SSH shell sessions to remote hosts. Environment and directory state persists across multiple command executions within the same connection.
 
-[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8.svg)](https://go.dev/dl/)
+[![Go Version](https://img.shields.io/badge/Go-1.27+-00ADD8.svg)](https://go.dev/dl/)
 [![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Features

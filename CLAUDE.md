@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MCP SSH Server is a pure Go Model Context Protocol server that provides AI agents with persistent SSH shell sessions to remote hosts. Key feature: environment and directory state persists across multiple command executions within the same connection.
 
-**Prerequisites:** Go 1.26+
+**Prerequisites:** Go 1.27+
 
 ## Common Commands
 

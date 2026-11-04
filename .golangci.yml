@@ -63,6 +63,13 @@ linters:
           - errcheck
           - dupl
           - gosec
+          - goconst
+
+      # MCP handlers build JSON responses whose keys repeat by design
+      - path: pkg/mcp/handlers\.go
+        text: "string `[a-z_]+` has \\d+ occurrences"
+        linters:
+          - goconst
 
       # Exclude known issues
       - text: "weak cryptographic primitive"
